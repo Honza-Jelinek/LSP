@@ -1,0 +1,119 @@
+.show-detail {
+  min-height: 100vh;
+  padding-bottom: 4rem;
+}
+
+.show-detail__hero {
+  padding: 1.6rem;
+  background: linear-gradient(160deg, rgba(229, 9, 20, 0.18), transparent 70%);
+}
+
+.show-detail__hero h1 {
+  font-size: 2.2rem;
+  margin: 0.8rem 0 0.3rem;
+}
+
+.show-detail__meta {
+  color: rgba(255, 255, 255, 0.55);
+  margin: 0;
+}
+
+.link {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0;
+}
+
+.link:hover {
+  color: #fff;
+}
+
+.show-detail__seasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0 1.6rem;
+  margin-bottom: 1.2rem;
+}
+
+.season-tab {
+  padding: 0.45rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.season-tab.is-active {
+  background: #e50914;
+  border-color: #e50914;
+  color: #fff;
+}
+
+.episode-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 1.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.episode-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.8rem 1rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.episode-row:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.episode-row__num {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.4);
+  min-width: 1.8rem;
+  text-align: center;
+}
+
+.episode-row__info {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.episode-row__title {
+  font-size: 0.95rem;
+}
+
+.episode-row__file {
+  font-size: 0.74rem;
+  color: rgba(255, 255, 255, 0.4);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-row__play {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.episode-row:hover .episode-row__play {
+  color: #e50914;
+}

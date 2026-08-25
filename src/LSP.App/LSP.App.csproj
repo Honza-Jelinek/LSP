@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>LSP.App</RootNamespace>
+    <AssemblyName>LSP</AssemblyName>
+    <ApplicationIcon>wwwroot\LSP.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LSP.Server\LSP.Server.csproj" />
+  </ItemGroup>
+
+  <!-- React build output (wwwroot) se kopíruje vedle exe, aby ho Kestrel našel i po publish -->
+  <ItemGroup>
+    <Content Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" Condition="Exists('wwwroot')" />
+  </ItemGroup>
+
+</Project>

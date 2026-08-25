@@ -1,0 +1,254 @@
+.player {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 100;
+  overflow: hidden;
+}
+
+.player--hidden-cursor {
+  cursor: none;
+}
+
+.player__video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* OVERLAY: absolutně nad videem, plnohodnotné DOM/CSS vrstvy. */
+.player__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  pointer-events: none;
+}
+
+.player__overlay.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.player__topbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.1rem 1.4rem;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.7), transparent);
+}
+
+.player__title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+
+.player__badge {
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.player__bigplay {
+  align-self: center;
+  margin: auto;
+  width: 90px;
+  height: 90px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 2.2rem;
+  cursor: pointer;
+  padding-left: 6px;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.player__bigplay:hover {
+  transform: scale(1.08);
+  background: rgba(229, 9, 20, 0.85);
+}
+
+.player__controls {
+  padding: 0.5rem 1.4rem 1.2rem;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.8), transparent);
+}
+
+.player__seek {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.25);
+  cursor: pointer;
+  margin-bottom: 0.8rem;
+}
+
+.player__seek:hover {
+  height: 8px;
+}
+
+.player__seek-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: #e50914;
+  border-radius: 3px;
+}
+
+.player__seek-knob {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e50914;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.6);
+}
+
+.player__buttons {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.player__spacer {
+  flex: 1;
+}
+
+.player__icon-btn {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  border-radius: 4px;
+  transition: background 0.15s ease;
+}
+
+.player__icon-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.player__time {
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.85);
+  font-variant-numeric: tabular-nums;
+}
+
+.player__volume {
+  width: 90px;
+  accent-color: #e50914;
+}
+
+.player__spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 54px;
+  height: 54px;
+  margin: -27px 0 0 -27px;
+  border: 4px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #e50914;
+  border-radius: 50%;
+  animation: player-spin 0.9s linear infinite;
+}
+
+@keyframes player-spin {
+  to { transform: rotate(360deg); }
+}
+
+.player__next {
+  position: absolute;
+  right: 2rem;
+  bottom: 6rem;
+  z-index: 5;
+}
+
+.player__next-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1.1rem 1.3rem;
+  border-radius: 12px;
+  background: rgba(20, 20, 26, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  max-width: 360px;
+}
+
+.player__next-label {
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.6);
+  text-transform: uppercase;
+}
+
+.player__next-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.player__next-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.3rem;
+}
+
+.player__next-play {
+  flex: 1;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: none;
+  background: #e50914;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.player__next-play:hover {
+  background: #f6121d;
+}
+
+.player__next-cancel {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+}
+
+.player__next-cancel:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.player__error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  color: #f87171;
+}
+
+.player__error button {
+  padding: 0.5rem 1.2rem;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+}

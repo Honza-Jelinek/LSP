@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LSP.App/LSP.App.csproj" />
+    <Project Path="src/LSP.Server/LSP.Server.csproj" />
+  </Folder>
+</Solution>

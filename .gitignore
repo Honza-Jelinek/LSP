@@ -1,0 +1,33 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Build output React SPA (generuje se z src/web)
+src/LSP.App/wwwroot/
+
+# Node
+node_modules/
+src/web/dist/
+
+# ffmpeg binárky (přibalují se lokálně, nepatří do repa)
+tools/ffmpeg/*
+!tools/ffmpeg/.gitkeep
+
+# Lokální data / DB
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vs/
+.idea/
+.vscode/
+.claude/settings.local.json
+
+
+# Installer
+artifacts/
+installer/
+
+graphify-out/

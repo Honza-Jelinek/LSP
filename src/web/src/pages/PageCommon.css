@@ -1,0 +1,79 @@
+.page {
+  padding: 1.6rem 2rem 4rem;
+}
+
+.page__header {
+  display: flex;
+  align-items: baseline;
+  gap: 1.2rem;
+  margin-bottom: 1.6rem;
+  flex-wrap: wrap;
+}
+
+.page__title {
+  font-size: 1.6rem;
+  margin: 0;
+}
+
+.page__search {
+  flex: 1;
+  max-width: 380px;
+  padding: 0.5rem 0.85rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+  font-size: 0.88rem;
+  outline: none;
+}
+
+.page__search:focus {
+  border-color: rgba(229, 9, 20, 0.6);
+}
+
+.page__empty {
+  color: rgba(255, 255, 255, 0.5);
+  margin-top: 2rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 1.1rem;
+}
+
+/* Settings */
+.settings-section {
+  margin-bottom: 2rem;
+}
+
+.settings-section h2 {
+  font-size: 1.1rem;
+  margin: 0 0 0.5rem;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.settings-stat {
+  color: rgba(255, 255, 255, 0.55);
+  margin: 0 0 0.8rem;
+  font-size: 0.9rem;
+}
+
+.settings-btn {
+  padding: 0.5rem 1.1rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+
+.settings-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
