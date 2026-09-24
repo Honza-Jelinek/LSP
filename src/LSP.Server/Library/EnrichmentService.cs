@@ -229,14 +229,28 @@ public sealed class EnrichmentService(
                 progress?.Report(new EnrichmentProgress(2.5, "LLM výběr", chooseIndex, chooseInputs.Count));
                 var groupSize = pendingMovies.TryGetValue(input.ItemKey, out var groupMovies) ? groupMovies.Count : 1;
 
-                if (!choices.TryGetValue(input.ItemKey, out var choice) || choice.ChosenTmdbId is not { } chosenId)
+                if (!choices.TryGetValue(input.ItemKey, out var choice) ||
+                    choice.ItemKey != input.ItemKey || choice.ChosenTmdbId is not { } chosenId)
                 {
                     reviewQueue += groupSize; // LLM řekl "žádný" nebo neodpověděl → zůstává bez TmdbId (review fronta)
                     continue;
                 }
 
+                if (!input.Candidates.Any(c => c.TmdbId == chosenId && c.MediaType == input.ExpectedKind))
+                {
+                    log.LogWarning("LLM zvolilo nenabídnuté ID {Id} nebo nesprávný typ pro '{Key}'", chosenId, input.ItemKey);
+                    reviewQueue += groupSize;
+                    continue;
+                }
+
                 var detail = await tmdb.GetDetailsAsync(chosenId, input.ExpectedKind, ct);
-                if (detail is null) { reviewQueue += groupSize; continue; }
+                if (detail is null || detail.TmdbId != chosenId || detail.MediaType != input.ExpectedKind)
+                {
+                    log.LogWarning("TMDB detail neodpovídá vybrané identitě {Type}:{Id} pro '{Key}'",
+                        input.ExpectedKind, chosenId, input.ItemKey);
+                    reviewQueue += groupSize;
+                    continue;
+                }
 
                 if (groupMovies is not null)
                 {
@@ -601,7 +615,7 @@ public sealed class EnrichmentService(
         return await db.TmdbCaches.FirstOrDefaultAsync(c => c.QueryKey == queryKey, ct);
     }
 
-    /// <summary>Zapíše rozhodnutí LLM disambiguace do TmdbCache (Score=0.95), aby ho příští scan/enrichment znovu nezkoušel.</summary>
+    /// <summary>Uloží validovanou volbu s reálným skóre shody názvu a roku, ne s odhadovanou jistotou LLM.</summary>
     private async Task UpsertTmdbCacheChoiceAsync(string title, int? year, string mediaType, TmdbSearchResult detail, CancellationToken ct)
     {
         var queryKey = NormalizeQueryKey(title, year, mediaType);
@@ -618,7 +632,7 @@ public sealed class EnrichmentService(
         cached.Rating = detail.Rating;
         cached.Genres = GenreFormat.ExtractNames(detail.Genres);
         cached.ReleaseYear = detail.ReleaseYear;
-        cached.Score = 0.95;
+        cached.Score = MatchScorer.Score(detail, title, year, mediaType);
         cached.FetchedAt = DateTime.UtcNow;
     }
 

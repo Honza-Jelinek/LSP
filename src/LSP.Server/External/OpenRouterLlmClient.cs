@@ -278,8 +278,9 @@ public sealed class OpenRouterLlmClient(
             callId, batch.Count, model);
 
         var bodyJson = JsonSerializer.Serialize(body, JsonOpts);
-        var validKeys = batch.Select(i => i.ItemKey).ToHashSet();
+        var inputsByKey = batch.ToDictionary(i => i.ItemKey);
         var results = new Dictionary<string, LlmChooseOutput>();
+        var seenKeys = new HashSet<string>();
 
         try
         {
@@ -325,14 +326,34 @@ public sealed class OpenRouterLlmClient(
                     continue;
                 }
                 var itemKey = ik.GetString()!;
-                if (!validKeys.Contains(itemKey))
+                if (!inputsByKey.TryGetValue(itemKey, out var input))
                 {
                     log.LogWarning("OpenRouter choose-call {CallId}: neznámý itemKey '{Key}' zahozen", callId, itemKey);
                     continue;
                 }
+                if (!seenKeys.Add(itemKey))
+                {
+                    // A conflicting duplicate must not turn a single answer into an arbitrary choice.
+                    results.Remove(itemKey);
+                    log.LogWarning("OpenRouter choose-call {CallId}: duplicitní itemKey '{Key}' zahozen", callId, itemKey);
+                    continue;
+                }
 
-                int? chosenTmdbId = item.TryGetProperty("tmdbId", out var tid) && tid.ValueKind == JsonValueKind.Number
-                    ? tid.GetInt32() : null;
+                if (!item.TryGetProperty("tmdbId", out var tid) ||
+                    (tid.ValueKind != JsonValueKind.Null &&
+                     (tid.ValueKind != JsonValueKind.Number || !tid.TryGetInt32(out _))))
+                {
+                    log.LogWarning("OpenRouter choose-call {CallId}: neplatné tmdbId pro '{Key}' zahozeno", callId, itemKey);
+                    continue;
+                }
+
+                int? chosenTmdbId = tid.ValueKind == JsonValueKind.Number ? tid.GetInt32() : null;
+                if (chosenTmdbId is { } chosenId && !input.Candidates.Take(MaxCandidatesPerItem)
+                    .Any(c => c.TmdbId == chosenId && c.MediaType == input.ExpectedKind))
+                {
+                    log.LogWarning("OpenRouter choose-call {CallId}: nenabídnuté tmdbId {Id} pro '{Key}' zahozeno", callId, chosenId, itemKey);
+                    continue;
+                }
 
                 results[itemKey] = new LlmChooseOutput(itemKey, chosenTmdbId);
             }
