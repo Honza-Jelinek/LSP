@@ -162,6 +162,36 @@ public sealed class EnrichmentStateTests
         Assert.Equal(0, summary.ReviewQueue);
     }
 
+    [Fact]
+    public async Task MovieFallbackResolvedShowIsNotSentToShowFallbackAgain()
+    {
+        await using var connection = await OpenDatabaseAsync();
+        await using var db = CreateDb(connection);
+        AddMovie(db, "Unparsed", "episode.mkv");
+        var show = AddShow(db, "Folder Name", "existing.S01E01.mkv");
+        await db.SaveChangesAsync();
+
+        var metadata = new Metadata();
+        metadata.Candidates[("Recognized Name", "tv")] = [Result(101, "tv", "Recognized Name", 2024)];
+        metadata.Details[101] = Result(101, "tv", "Folder Name", 2024);
+        metadata.Candidates[("Wrong Name", "tv")] = [Result(999, "tv", "Wrong Name", 2024)];
+        var llm = new Llm
+        {
+            Parser = input => input.RegexGuessKind == "movie"
+                ? new LlmParseOutput("episode", "Recognized Name", null, 1, 2, null)
+                : new LlmParseOutput("tv", "Wrong Name", null, null, null, null)
+        };
+
+        var summary = await Service(db, metadata, llm).EnrichAsync();
+
+        Assert.Equal(101, show.TmdbId);
+        Assert.Equal(2, await db.Episodes.CountAsync(e => e.ShowId == show.Id));
+        Assert.Single(llm.ParsedInputs);
+        Assert.Equal(1, summary.LlmFallbacks);
+        Assert.Equal(1, summary.LlmRecovered);
+        Assert.Equal(0, summary.ReviewQueue);
+    }
+
     private static EnrichmentService Service(LibraryDbContext db, Metadata metadata, Llm llm) =>
         new(db, metadata, llm, new SeasonEpisodeCache(db, metadata), new SettingsService(db),
             NullLogger<EnrichmentService>.Instance);
