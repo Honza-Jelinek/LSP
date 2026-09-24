@@ -136,6 +136,10 @@ test('failed progress read never starts or overwrites saved position', async () 
 
 test('cancelled autoplay stays cancelled through time updates and ended', async () => {
   const h = harness({ nextEpisode: { mediaFileId: 12, season: 1, number: 2 }, showNext: true })
+  h.resolveProgress(null)
+  h.resolveSound({ volume: 1, muted: false })
+  h.videoNode.props.onLoadedMetadata({ currentTarget: h.video })
+  await h.flush()
   const find = (node, predicate) => {
     if (!node || typeof node !== 'object') return null
     if (predicate(node)) return node
@@ -154,6 +158,18 @@ test('cancelled autoplay stays cancelled through time updates and ended', async 
   h.videoNode.props.onEnded()
   assert.equal(h.nextCalls.length, 0)
   assert.equal(h.showNextChanges.includes(true), false)
+  h.cleanup()
+})
+
+test('autoplay does not appear before the initial position is applied', async () => {
+  const h = harness({ nextEpisode: { mediaFileId: 12, season: 1, number: 2 } })
+  h.resolveSound({ volume: 1, muted: false })
+  h.videoNode.props.onLoadedMetadata({ currentTarget: h.video })
+  h.video.currentTime = 3595
+  h.videoNode.props.onTimeUpdate({ currentTarget: h.video })
+  h.videoNode.props.onEnded()
+  assert.equal(h.showNextChanges.includes(true), false)
+  assert.equal(h.nextCalls.length, 0)
   h.cleanup()
 })
 
@@ -257,5 +273,24 @@ test('HLS resume heartbeat waits behind an in-flight pause heartbeat', async () 
   h.releasePause()
   await h.flush()
   assert.equal(h.heartbeats.at(-1)[2], false)
+  h.cleanup()
+})
+
+test('paused HLS seek keeps loading until the target frame is available', async () => {
+  const h = harness({ hls: true })
+  h.resolveProgress(null)
+  h.resolveSound({ volume: 1, muted: false })
+  await h.flush()
+  h.videoNode.props.onLoadedMetadata({ currentTarget: h.video })
+  h.video.pause()
+  h.videoNode.props.onPause({ currentTarget: h.video })
+  h.video.currentTime = 2000
+  h.video.readyState = 1
+  h.videoNode.props.onSeeking({ currentTarget: h.video })
+  h.videoNode.props.onSeeked({ currentTarget: h.video })
+  assert.equal(h.hlsCalls.at(-1)[0], 'start')
+  h.video.readyState = 2
+  h.videoNode.props.onLoadedData({ currentTarget: h.video })
+  assert.equal(h.hlsCalls.at(-1), 'stop')
   h.cleanup()
 })

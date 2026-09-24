@@ -59,6 +59,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   const streamMode = useRef<'direct' | 'hls' | null>(null)
   const activeHls = useRef<Hls | null>(null)
   const hlsLoadingPaused = useRef(false)
+  const pausedSeekLoading = useRef(false)
   const streamPaused = useRef(false)
   const sendStreamHeartbeat = useRef<((paused: boolean, position: number) => void) | null>(null)
   const lastSavedPosition = useRef<{ position: number; keepalive: boolean } | null>(null)
@@ -201,6 +202,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     streamMode.current = null
     streamPaused.current = false
     hlsLoadingPaused.current = false
+    pausedSeekLoading.current = false
     const videoAtStart = videoRef.current
     metadataReady.current = false
     setBuffering(true)
@@ -253,6 +255,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
       hls?.destroy()
       if (activeHls.current === hls) activeHls.current = null
       hlsLoadingPaused.current = false
+      pausedSeekLoading.current = false
       if (videoAtStart) { videoAtStart.pause(); videoAtStart.removeAttribute('src'); videoAtStart.load() }
       release()
       if (streamSession.current === session) streamSession.current = null
@@ -268,6 +271,15 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     hideTimer.current = window.setTimeout(() => {
       if (videoRef.current && !videoRef.current.paused) setControlsVisible(false)
     }, 2800)
+  }, [])
+
+  const finishPausedSeek = useCallback((video: HTMLVideoElement) => {
+    if (!pausedSeekLoading.current || !video.paused || video.readyState < 2 || !activeHls.current) return
+    activeHls.current.stopLoad()
+    hlsLoadingPaused.current = true
+    pausedSeekLoading.current = false
+    streamPaused.current = true
+    sendStreamHeartbeat.current?.(true, video.currentTime)
   }, [])
 
   const togglePlay = useCallback(() => {
@@ -328,6 +340,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   }, [previousEpisode, onPlayPrevious])
 
   const handleEnded = useCallback(() => {
+    if (!progressReady.current || !metadataReady.current || resumeSeekPending.current || resumeTo.current != null) return
     saveNow()
     if (!nextEpisode || cancelledAutoplay.current) return
     if (showNext) { playNext(); return }
@@ -429,6 +442,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
         ref={videoRef}
         onClick={togglePlay}
         onPlay={(e) => {
+          pausedSeekLoading.current = false
           streamPaused.current = false
           if (streamSession.current && streamMode.current === 'hls')
             sendStreamHeartbeat.current?.(false, e.currentTarget.currentTime)
@@ -464,19 +478,16 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
           startIfReady()
         }}
         onSeeked={(e) => {
-          if (e.currentTarget.paused && activeHls.current) {
-            activeHls.current.stopLoad()
-            hlsLoadingPaused.current = true
-            streamPaused.current = true
-            if (streamSession.current)
-              sendStreamHeartbeat.current?.(true, e.currentTarget.currentTime)
-          }
-          if (resumeSeekPending.current) {
+          const wasResumeSeek = resumeSeekPending.current
+          if (wasResumeSeek) {
             resumeSeekPending.current = false
+            pausedSeekLoading.current = false
             startIfReady()
-          }
+          } else finishPausedSeek(e.currentTarget)
           setCurrent(e.currentTarget.currentTime)
         }}
+        onLoadedData={(e) => finishPausedSeek(e.currentTarget)}
+        onCanPlay={(e) => finishPausedSeek(e.currentTarget)}
         onTimeUpdate={(e) => {
           const v = e.currentTarget
           if (resumeSeekPending.current && !v.seeking && resumeTo.current == null) {
@@ -490,7 +501,9 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
             savePosition(v)
             lastSave.current = now
           }
-          if (!endedCountdown && nextEpisode && !cancelledAutoplay.current && Number.isFinite(v.duration)) {
+          if (progressReady.current && metadataReady.current && soundReady.current
+              && !resumeSeekPending.current && resumeTo.current == null
+              && !endedCountdown && nextEpisode && !cancelledAutoplay.current && Number.isFinite(v.duration)) {
             const remaining = v.duration - v.currentTime
             if (remaining > AUTOPLAY_LEAD || remaining < 0 || v.currentTime <= 0) setShowNext(false)
             else {
@@ -501,6 +514,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
         }}
         onSeeking={(e) => {
           if (e.currentTarget.paused && activeHls.current) {
+            pausedSeekLoading.current = true
             streamPaused.current = false
             if (streamSession.current)
               sendStreamHeartbeat.current?.(false, e.currentTarget.currentTime)
