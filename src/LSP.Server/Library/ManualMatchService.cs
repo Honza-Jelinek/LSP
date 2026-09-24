@@ -31,12 +31,6 @@ public sealed class ManualMatchService(
         await UpsertMatchAsync(file.Path, kind, tmdbId, mediaType, season, episode, null, ct);
         await ApplyFileMatchAsync(file, kind, tmdbId, mediaType, season, episode, ct);
 
-        // Auto-create alias pro příští automatický match
-        var dirName = Path.GetFileName(Path.GetDirectoryName(file.Path));
-        if (dirName is not null)
-            await UpsertAliasAsync($"folder:{dirName}", tmdbId, mediaType, ct);
-        await UpsertAliasAsync($"title:{MatchScorer.Normalize(file.Episode?.Show?.Title ?? file.Movie?.Title ?? kind)}", tmdbId, mediaType, ct);
-
         await db.SaveChangesAsync(ct);
         log.LogInformation("Ruční korekce: '{File}' → {Kind} (tmdbId {Id}{SE})",
             file.FileName, kind, tmdbId, kind == "episode" ? $", S{season}E{episode}" : "");
@@ -79,17 +73,6 @@ public sealed class ManualMatchService(
 
         // Auto-create alias pro příští automatický match
         await UpsertAliasAsync($"title:{MatchScorer.Normalize(show.Title)}", tmdbId, "tv", ct);
-
-        // Alias na skutečné content foldery epizod (ne na Show.Title — ten je jen grouping key,
-        // ne nutně stejný jako název složky na disku, viz "south park 27" vs. "South Park").
-        var roots = await db.LibraryFolders.Select(f => f.Path).ToListAsync(ct);
-        var contentFolders = episodes
-            .Select(e => SeasonFolderDetector.GetContentFolderFromPath(e.MediaFile.Path, roots))
-            .Where(f => f is not null)
-            .Select(f => f!)
-            .Distinct(StringComparer.OrdinalIgnoreCase);
-        foreach (var folder in contentFolders)
-            await UpsertAliasAsync($"folder:{folder}", tmdbId, "tv", ct);
 
         await db.SaveChangesAsync(ct);
         log.LogInformation("Ruční re-match seriálu '{Show}' → tmdbId {Id}", show.Title, tmdbId);

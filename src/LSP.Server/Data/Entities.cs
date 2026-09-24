@@ -176,13 +176,14 @@ public sealed class ManualMatch
 }
 
 /// <summary>
-/// Alias pro automatický match: folder:název, title:název, imdb:tt1234567 → TmdbId.
-/// Vytváří se automaticky po ruční korekci. Příští scan stejné složky → auto match bez TMDB search.
+/// Alias pro automatický match: title:název → TmdbId.
+/// Starší folder: aliasy existují v uložených knihovnách, ale enrichment je ignoruje,
+/// protože obsahují jen název složky bez bezpečně určitelného rozsahu.
 /// </summary>
 public sealed class MatchAlias
 {
     public int Id { get; set; }
-    public required string Key { get; set; }      // "folder:Breaking Bad" | "title:avatar last airbender" | "imdb:tt0468569"
+    public required string Key { get; set; }      // "title:avatar last airbender" (starší "folder:..." se ignorují)
     public int TmdbId { get; set; }
     public required string MediaType { get; set; } // "movie" | "tv"
     public DateTime CreatedAt { get; set; }

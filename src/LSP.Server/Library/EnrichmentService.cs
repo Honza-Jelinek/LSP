@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Diagnostics.CodeAnalysis;
 using LSP.Server.Data;
 using LSP.Server.External;
 using LSP.Server.Library.Parsing;
@@ -89,7 +90,7 @@ public sealed class EnrichmentService(
             if (alias is not null)
             {
                 var detail = await tmdb.GetDetailsAsync(alias.Value.TmdbId, "movie", ct);
-                if (detail is not null)
+                if (IsExpectedIdentity(detail, alias.Value.TmdbId, "movie"))
                 {
                     await ApplyToMovieAsync(movie, detail, fetchPosters, ct);
                     if (detail.PosterPath is not null && fetchPosters) posters++;
@@ -102,7 +103,7 @@ public sealed class EnrichmentService(
             if (movie.ImdbId is not null)
             {
                 var imdbResult = await tmdb.FindByImdbAsync(movie.ImdbId, ct);
-                if (imdbResult is not null)
+                if (IsExpectedType(imdbResult, "movie"))
                 {
                     await ApplyToMovieAsync(movie, imdbResult, fetchPosters, ct);
                     if (imdbResult.PosterPath is not null && fetchPosters) posters++;
@@ -170,7 +171,7 @@ public sealed class EnrichmentService(
             if (alias is not null)
             {
                 var detail = await tmdb.GetDetailsAsync(alias.Value.TmdbId, "tv", ct);
-                if (detail is not null)
+                if (IsExpectedIdentity(detail, alias.Value.TmdbId, "tv"))
                 {
                     await ApplyToShowAsync(show, detail, fetchPosters, ct);
                     if (detail.PosterPath is not null && fetchPosters) posters++;
@@ -184,7 +185,7 @@ public sealed class EnrichmentService(
             if (show.ImdbId is not null)
             {
                 var imdbResult = await tmdb.FindByImdbAsync(show.ImdbId, ct);
-                if (imdbResult is not null)
+                if (IsExpectedType(imdbResult, "tv"))
                 {
                     await ApplyToShowAsync(show, imdbResult, fetchPosters, ct);
                     if (imdbResult.PosterPath is not null && fetchPosters) posters++;
@@ -415,32 +416,21 @@ public sealed class EnrichmentService(
     private (int TmdbId, string MediaType)? ResolveAlias(
         List<MatchAlias> aliases, string title, string? filePath, string expectedType, IReadOnlyCollection<string>? roots = null)
     {
-        // Nejdřív zkus nejbližší rodičovskou složku
-        if (filePath is not null)
-        {
-            var dirName = Path.GetFileName(Path.GetDirectoryName(filePath));
-            if (dirName is not null)
-            {
-                var folderAlias = aliases.FirstOrDefault(a => a.Key == $"folder:{dirName}");
-                if (folderAlias is not null) return (folderAlias.TmdbId, folderAlias.MediaType);
-            }
-
-            // Pak content folder (u seriálů se nejbližší rodič obvykle liší od Season-skipnutého content folderu)
-            var contentFolder = SeasonFolderDetector.GetContentFolderFromPath(filePath, roots);
-            if (contentFolder is not null && !string.Equals(contentFolder, dirName, StringComparison.OrdinalIgnoreCase))
-            {
-                var contentAlias = aliases.FirstOrDefault(a => a.Key == $"folder:{contentFolder}");
-                if (contentAlias is not null) return (contentAlias.TmdbId, contentAlias.MediaType);
-            }
-        }
-
-        // Pak normalizovaný title
+        // Legacy folder aliases store only a basename. Their scope is ambiguous (library root,
+        // genre, or title folder), so they must never supply an automatic identity.
         var norm = MatchScorer.Normalize(title);
-        var titleAlias = aliases.FirstOrDefault(a => a.Key == $"title:{norm}");
+        var titleAlias = aliases.FirstOrDefault(a => a.Key == $"title:{norm}" &&
+            a.MediaType == expectedType && a.TmdbId > 0);
         if (titleAlias is not null) return (titleAlias.TmdbId, titleAlias.MediaType);
 
         return null;
     }
+
+    private static bool IsExpectedType([NotNullWhen(true)] TmdbSearchResult? result, string expectedType) =>
+        result is not null && result.TmdbId > 0 && result.MediaType == expectedType;
+
+    private static bool IsExpectedIdentity([NotNullWhen(true)] TmdbSearchResult? result, int tmdbId, string expectedType) =>
+        IsExpectedType(result, expectedType) && result!.TmdbId == tmdbId;
 
     /// <summary>Skórovaný TMDB search: vyber nejlepšího kandidáta s vahou. Vrací i kandidáty (pro LLM disambiguaci).</summary>
     private async Task<(TmdbCache? best, double score, IReadOnlyList<TmdbSearchResult> candidates)> TryTmdbScoredAsync(
@@ -448,7 +438,8 @@ public sealed class EnrichmentService(
     {
         var queryKey = NormalizeQueryKey(title, year, mediaType);
         var cached = await FindTmdbCacheAsync(queryKey, ct);
-        if (!_forceRefresh && cached is not null && DateTime.UtcNow - cached.FetchedAt < CacheTtl)
+        if (!_forceRefresh && cached is not null && DateTime.UtcNow - cached.FetchedAt < CacheTtl &&
+            (cached.TmdbId is null || cached.TmdbId > 0 && cached.MediaType == mediaType))
             return (cached.TmdbId is not null ? cached : null, cached.TmdbId is not null ? (cached.Score ?? 1.0) : 0.0, []);
 
         // Načti kandidáty
@@ -460,6 +451,7 @@ public sealed class EnrichmentService(
         double bestScore = 0;
         foreach (var c in candidates)
         {
+            if (!IsExpectedType(c, mediaType)) continue;
             var s = MatchScorer.Score(c, title, year, mediaType);
             if (s > bestScore) { bestScore = s; bestCandidate = c; }
         }
@@ -468,7 +460,7 @@ public sealed class EnrichmentService(
 
         // Stáhni detail (pro poster, overview atd.)
         var detail = await tmdb.GetDetailsAsync(bestCandidate.TmdbId, mediaType, ct);
-        if (detail is null) return (null, 0.0, candidates);
+        if (!IsExpectedIdentity(detail, bestCandidate.TmdbId, mediaType)) return (null, 0.0, candidates);
 
         string? posterFile = null;
         if (fetchPosters && detail.PosterPath is not null)
@@ -496,22 +488,13 @@ public sealed class EnrichmentService(
         return (cached, bestScore, candidates);
     }
 
-    /// <summary>Zkusí film; pokud nenajde vůbec nic, zkusí seriál (levný fallback). Vyhýbá se zbytečným API callům.</summary>
+    /// <summary>Vyhledá pouze očekávaný typ; TV identita se nesmí aplikovat na Movie.</summary>
     private async Task<(TmdbCache? best, double score, IReadOnlyList<TmdbSearchResult> candidates)> TryTmdbMovieThenTvScoredAsync(
         string title, int? year, string mediaType, bool fetchPosters, CancellationToken ct)
     {
-        var (movie, movieScore, movieCandidates) = await TryTmdbScoredAsync(title, year, "movie", fetchPosters, ct);
-        // Pokud film našel něco s alespoň review skóre, ber ho
-        if (movie is not null && movieScore >= ReviewThreshold)
-            return (movie, movieScore, movieCandidates);
-        // TV fallback jen pokud movie nenašlo VŮBEC nic (nebo je skóre hrozné)
-        if (movie is null || movieScore < 0.30)
-        {
-            var (tv, tvScore, tvCandidates) = await TryTmdbScoredAsync(title, null, "tv", fetchPosters, ct);
-            if (tv is not null && tvScore > movieScore)
-                return (tv, tvScore, tvCandidates);
-        }
-        return (movie, movieScore, movieCandidates);
+        return mediaType == "movie"
+            ? await TryTmdbScoredAsync(title, year, "movie", fetchPosters, ct)
+            : (null, 0.0, []);
     }
 
     /// <summary>Zkusí TMDB "tv" search pro víc titulových variant, vrátí nejlepší skóre; skončí dřív při jistém zásahu.</summary>
