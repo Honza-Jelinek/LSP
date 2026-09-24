@@ -70,6 +70,7 @@ export type SubtitleTrack = {
 
 export type StreamInfo = {
   mediaFileId: number
+  sessionId?: string | null
   mode: 'direct' | 'hls'
   url: string
   durationSeconds: number | null
@@ -286,21 +287,25 @@ export type TvEpisode = {
 export const api = {
   getLibrary: () => fetch('/api/library').then(json<Library>),
   scan: () => fetch('/api/library/scan', { method: 'POST' }).then(json<ScanSummary>),
-  getStreamInfo: (mediaFileId: number, audioOrdinal?: number | null) => {
-    const qs = audioOrdinal == null ? '' : `?audio=${audioOrdinal}`
-    return fetch(`/api/stream/${mediaFileId}/info${qs}`).then(json<StreamInfo>)
+  getStreamInfo: (mediaFileId: number, audioOrdinal?: number | null, sessionId?: string) => {
+    const qs = new URLSearchParams()
+    if (audioOrdinal != null) qs.set('audio', String(audioOrdinal))
+    if (sessionId) qs.set('session', sessionId)
+    return fetch(`/api/stream/${mediaFileId}/info?${qs}`).then(json<StreamInfo>)
   },
 
-  saveProgress: (mediaFileId: number, positionSeconds: number, durationSeconds: number | null) =>
+  saveProgress: (mediaFileId: number, positionSeconds: number, durationSeconds: number | null, sessionId?: string, sequence?: number) =>
     fetch('/api/progress', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mediaFileId, positionSeconds, durationSeconds }),
-    }),
+      body: JSON.stringify({ mediaFileId, positionSeconds, durationSeconds, sessionId, sequence }),
+    }).then(ensureOk),
 
-  getProgress: async (mediaFileId: number): Promise<Progress | null> => {
-    const res = await fetch(`/api/progress/${mediaFileId}`)
-    if (res.status === 204 || !res.ok) return null
+  getProgress: async (mediaFileId: number, sessionId?: string): Promise<Progress | null> => {
+    const query = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+    const res = await fetch(`/api/progress/${mediaFileId}${query}`)
+    if (res.status === 204) return null
+    if (!res.ok) throw new Error(`Načtení uložené pozice selhalo (${res.status}).`)
     return res.json() as Promise<Progress>
   },
 
@@ -310,8 +315,13 @@ export const api = {
   deleteShowProgress: (showId: number) =>
     fetch(`/api/progress/show/${showId}`, { method: 'DELETE' }).then(ensureOk),
   /** Zahodí transkód segmenty souboru (voláno při přepnutí na jinou epizodu). */
-  purgeSegments: (mediaFileId: number) =>
-    fetch(`/api/stream/${mediaFileId}/segments`, { method: 'DELETE' }).then(ensureOk),
+  purgeSegments: (mediaFileId: number, sessionId: string) =>
+    fetch(`/api/stream/${mediaFileId}/segments?session=${encodeURIComponent(sessionId)}`, { method: 'DELETE', keepalive: true }).then(ensureOk),
+  heartbeatStream: (mediaFileId: number, sessionId: string, paused: boolean, positionSeconds: number) =>
+    fetch(`/api/stream/${mediaFileId}/heartbeat?session=${encodeURIComponent(sessionId)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paused, positionSeconds }),
+    }).then(ensureOk),
 
   getLibraryFolders: () => fetch('/api/settings/libraries').then(json<LibraryFolder[]>),
   addLibraryFolder: (path: string) =>
@@ -364,6 +374,12 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ language }),
+    }).then(ensureOk),
+  getPlayerSound: () => fetch('/api/settings/player/sound').then(json<{ volume: number; muted: boolean }>),
+  savePlayerSound: (volume: number, muted: boolean) =>
+    fetch('/api/settings/player/sound', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ volume, muted }),
     }).then(ensureOk),
 
   searchTmdb: (q: string, type: 'movie' | 'tv') =>

@@ -8,6 +8,7 @@ import PauseIcon from '@mui/icons-material/Pause'
 import FullscreenIcon from '@mui/icons-material/Fullscreen'
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit'
 import VolumeUpIcon from '@mui/icons-material/VolumeUp'
+import VolumeOffIcon from '@mui/icons-material/VolumeOff'
 import Replay5Icon from '@mui/icons-material/Replay5'
 import Forward5Icon from '@mui/icons-material/Forward5'
 import SkipPreviousIcon from '@mui/icons-material/SkipPrevious'
@@ -45,6 +46,16 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   const hideTimer = useRef<number | undefined>(undefined)
   const resumeTo = useRef<number | null>(null)
   const playWhenReady = useRef(true)
+  const playbackSession = useRef({ mediaFileId, id: crypto.randomUUID(), sequence: 0 })
+  if (playbackSession.current.mediaFileId !== mediaFileId)
+    playbackSession.current = { mediaFileId, id: crypto.randomUUID(), sequence: 0 }
+  const progressReady = useRef(false)
+  const metadataReady = useRef(false)
+  const soundReady = useRef(false)
+  const streamSession = useRef<string | null>(null)
+  const streamMode = useRef<'direct' | 'hls' | null>(null)
+  const soundSaveQueue = useRef<Promise<void>>(Promise.resolve())
+  const cancelledAutoplay = useRef(false)
   // Inicializace na "teď" → první throttlované uložení proběhne až po ~5 s, ne hned na pozici 0.
   const lastSave = useRef<number>(Date.now())
 
@@ -55,6 +66,10 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
   const [volume, setVolume] = useState(1)
+  const [muted, setMuted] = useState(false)
+  const [progressRetry, setProgressRetry] = useState(0)
+  const [loadRetry, setLoadRetry] = useState(0)
+  const [endedCountdown, setEndedCountdown] = useState(false)
   const [controlsVisible, setControlsVisible] = useState(true)
   const [nextEpisode, setNextEpisode] = useState<NextEpisode | null>(null)
   const [previousEpisode, setPreviousEpisode] = useState<NextEpisode | null>(null)
@@ -70,37 +85,92 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     setSelectedSubtitleId(null)
     resumeTo.current = null
     playWhenReady.current = true
+    cancelledAutoplay.current = false
+    progressReady.current = false
+    metadataReady.current = false
   }, [mediaFileId])
+
+  const startIfReady = useCallback(() => {
+    const video = videoRef.current
+    if (!video || !progressReady.current || !metadataReady.current || !soundReady.current) return
+    if (resumeTo.current != null) {
+      const target = resumeTo.current
+      if (Number.isFinite(video.duration) && target < video.duration - 10)
+        video.currentTime = Math.max(0, target)
+      resumeTo.current = null
+    }
+    if (playWhenReady.current) void video.play().catch(() => setPlaying(false))
+    else { video.pause(); setPlaying(false) }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    soundReady.current = false
+    progressReady.current = false
+    setError(null)
+    const session = playbackSession.current.id
+    void api.getProgress(mediaFileId, session).then((p) => {
+      if (cancelled || playbackSession.current.id !== session) return
+      if (!fromStart && p && !p.finished && p.positionSeconds > 5)
+        resumeTo.current = p.positionSeconds
+      progressReady.current = true
+      startIfReady()
+    }).catch((e: unknown) => {
+      if (!cancelled) setError(`Uloženou pozici nelze načíst: ${String(e)}`)
+    })
+    return () => { cancelled = true }
+  }, [mediaFileId, fromStart, progressRetry, startIfReady])
+
+  useEffect(() => {
+    let cancelled = false
+    void api.getPlayerSound().then((sound) => {
+      if (cancelled) return
+      const video = videoRef.current
+      if (video) { video.volume = sound.volume; video.muted = sound.muted }
+      setVolume(sound.volume)
+      setMuted(sound.muted)
+      soundReady.current = true
+      startIfReady()
+    }).catch((e: unknown) => { if (!cancelled) setError(`Nastavení zvuku nelze načíst: ${String(e)}`) })
+    return () => { cancelled = true }
+  }, [startIfReady, loadRetry])
 
   // Načti info o další epizodě (pro autoplay).
   useEffect(() => {
     setNextEpisode(null)
     setPreviousEpisode(null)
     setShowNext(false)
-    void api.getNextEpisode(mediaFileId).then(setNextEpisode).catch(() => setNextEpisode(null))
-    void api.getPreviousEpisode(mediaFileId).then(setPreviousEpisode).catch(() => setPreviousEpisode(null))
+    let cancelled = false
+    void api.getNextEpisode(mediaFileId).then((next) => { if (!cancelled) setNextEpisode(next) }).catch(() => undefined)
+    void api.getPreviousEpisode(mediaFileId).then((previous) => { if (!cancelled) setPreviousEpisode(previous) }).catch(() => undefined)
+    return () => { cancelled = true }
   }, [mediaFileId])
 
   // Načti info o streamu a napoj zdroj (direct = src, hls = hls.js).
   useEffect(() => {
     let hls: Hls | null = null
     let cancelled = false
+    const session = crypto.randomUUID()
+    streamSession.current = session
+    streamMode.current = null
+    const videoAtStart = videoRef.current
+    metadataReady.current = false
     setBuffering(true)
-    setError(null)
-
-    // Zjisti uloženou pozici pro „pokračovat v přehrávání" (přeskoč, pokud vyžádáno od začátku).
-    if (!fromStart && selectedAudioOrdinal == null) {
-      void api.getProgress(mediaFileId).then((p) => {
-        if (!cancelled && p && !p.finished && p.positionSeconds > 5) {
-          resumeTo.current = p.positionSeconds
-        }
-      })
+    const release = () => { void api.purgeSegments(mediaFileId, session).catch(() => undefined) }
+    const heartbeat = () => {
+      const video = videoAtStart
+      if (!cancelled && video && streamMode.current === 'hls')
+        void api.heartbeatStream(mediaFileId, session, video.paused || video.readyState < 3,
+          Number.isFinite(video.currentTime) ? video.currentTime : 0).catch(() => undefined)
     }
+    const heartbeatTimer = window.setInterval(heartbeat, 10000)
+    window.addEventListener('pagehide', release)
 
     api
-      .getStreamInfo(mediaFileId, selectedAudioOrdinal)
+      .getStreamInfo(mediaFileId, selectedAudioOrdinal, session)
       .then((streamInfo) => {
-        if (cancelled) return
+        if (cancelled) { release(); return }
+        streamMode.current = streamInfo.mode
         setInfo(streamInfo)
         const video = videoRef.current
         if (!video) return
@@ -122,19 +192,21 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
           // Direct play, nebo nativní HLS (Safari).
           video.src = streamInfo.url
         }
-        if (playWhenReady.current) void video.play().catch(() => setPlaying(false))
-        else {
-          video.pause()
-          setPlaying(false)
-        }
+        heartbeat()
       })
-      .catch((e: unknown) => setError(String(e)))
+      .catch((e: unknown) => { if (!cancelled) setError(String(e)) })
 
     return () => {
       cancelled = true
+      window.clearInterval(heartbeatTimer)
+      window.removeEventListener('pagehide', release)
       hls?.destroy()
+      if (videoAtStart) { videoAtStart.pause(); videoAtStart.removeAttribute('src'); videoAtStart.load() }
+      release()
+      if (streamSession.current === session) streamSession.current = null
+      streamMode.current = null
     }
-  }, [mediaFileId, fromStart, selectedAudioOrdinal])
+  }, [mediaFileId, selectedAudioOrdinal, loadRetry])
 
   const showControlsTemporarily = useCallback(() => {
     setControlsVisible(true)
@@ -146,14 +218,14 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current
-    if (!video) return
+    if (!video || !progressReady.current || !soundReady.current || !metadataReady.current) return
     if (video.paused) void video.play()
     else video.pause()
   }, [])
 
   const seekBy = useCallback((seconds: number) => {
     const video = videoRef.current
-    if (!video) return
+    if (!video || !progressReady.current || !metadataReady.current) return
     const durationLimit = Number.isFinite(video.duration) ? video.duration : Number.POSITIVE_INFINITY
     video.currentTime = Math.max(0, Math.min(durationLimit, video.currentTime + seconds))
     showControlsTemporarily()
@@ -182,15 +254,23 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     setTrackMenuAnchor(null)
   }, [])
 
-  const saveNow = useCallback(() => {
-    const video = videoRef.current
-    if (!video || video.currentTime < 3) return
-    void api.saveProgress(
-      mediaFileId, video.currentTime, Number.isFinite(video.duration) ? video.duration : null)
+  const savePosition = useCallback((video: HTMLVideoElement | null) => {
+    if (!video || !progressReady.current || resumeTo.current != null || video.currentTime < 3) return
+    const session = playbackSession.current
+    if (session.mediaFileId !== mediaFileId) return
+    const sequence = ++session.sequence
+    void api.saveProgress(mediaFileId, video.currentTime,
+      Number.isFinite(video.duration) ? video.duration : null, session.id, sequence)
+      .catch(() => undefined)
   }, [mediaFileId])
 
+  const saveNow = useCallback(() => savePosition(videoRef.current), [savePosition])
+
   // Ulož pozici při zavření přehrávače.
-  useEffect(() => () => saveNow(), [saveNow])
+  useEffect(() => {
+    const video = videoRef.current
+    return () => savePosition(video)
+  }, [savePosition])
 
   // Při odmountování vždy vypni fullscreen (idempotentní) — jinak okno zůstane
   // zaseknuté ve fullscreenu bez klávesových zkratek, které žily jen tady.
@@ -202,36 +282,37 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   const playNext = useCallback(() => {
     if (!nextEpisode) return
     saveNow()
-    void api.purgeSegments(mediaFileId).catch(() => undefined) // segmenty aktuální epizody už nepotřebujeme
     onPlayNext?.(nextEpisode)
-  }, [nextEpisode, onPlayNext, saveNow, mediaFileId])
+  }, [nextEpisode, onPlayNext, saveNow])
 
   const playPrevious = useCallback(() => {
     if (!previousEpisode) return
     saveNow()
-    void api.purgeSegments(mediaFileId).catch(() => undefined)
     onPlayPrevious?.(previousEpisode)
-  }, [previousEpisode, onPlayPrevious, saveNow, mediaFileId])
+  }, [previousEpisode, onPlayPrevious, saveNow])
 
   const handleEnded = useCallback(() => {
     saveNow()
-    // Popup se obvykle objeví už během posledních ~10 s (viz onTimeUpdate); tady jen fallback.
-    if (nextEpisode && !showNext) {
+    if (!nextEpisode || cancelledAutoplay.current) return
+    if (showNext) { playNext(); return }
+    // Některé zdroje přeskočí události času blízko konce; pak dáme uživateli odpočet.
+    if (nextEpisode) {
       setCountdown(AUTOPLAY_LEAD)
       setShowNext(true)
+      setEndedCountdown(true)
     }
-  }, [nextEpisode, saveNow, showNext])
+  }, [nextEpisode, saveNow, showNext, playNext])
 
   // Odpočet do automatického přehrání další epizody.
   useEffect(() => {
-    if (!showNext) return
+    if (!showNext || !endedCountdown || cancelledAutoplay.current) return
     if (countdown <= 0) {
       playNext()
       return
     }
     const t = window.setTimeout(() => setCountdown((c) => c - 1), 1000)
     return () => window.clearTimeout(t)
-  }, [showNext, countdown, playNext])
+  }, [showNext, endedCountdown, countdown, playNext])
 
   const toggleFullscreen = useCallback(() => {
     const photino = getPhotino()
@@ -312,33 +393,57 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
         ref={videoRef}
         onClick={togglePlay}
         onPlay={() => { setPlaying(true); showControlsTemporarily() }}
-        onPause={() => { setPlaying(false); setControlsVisible(true); saveNow() }}
+        onPause={(e) => {
+          setPlaying(false); setControlsVisible(true); savePosition(e.currentTarget)
+          if (streamSession.current && streamMode.current === 'hls')
+            void api.heartbeatStream(mediaFileId, streamSession.current, true, e.currentTarget.currentTime).catch(() => undefined)
+        }}
         onWaiting={() => setBuffering(true)}
-        onPlaying={() => setBuffering(false)}
+        onPlaying={(e) => {
+          setBuffering(false)
+          if (streamSession.current && streamMode.current === 'hls')
+            void api.heartbeatStream(mediaFileId, streamSession.current, false, e.currentTarget.currentTime).catch(() => undefined)
+        }}
         onLoadedMetadata={(e) => {
           const v = e.currentTarget
           setDuration(v.duration)
-          if (resumeTo.current != null && Number.isFinite(v.duration) && resumeTo.current < v.duration - 10)
-            v.currentTime = resumeTo.current
-          resumeTo.current = null
+          metadataReady.current = true
+          startIfReady()
         }}
         onTimeUpdate={(e) => {
           const v = e.currentTarget
           setCurrent(v.currentTime)
           const now = Date.now()
-          if (v.currentTime >= 3 && now - lastSave.current > 5000) {
+          if (progressReady.current && resumeTo.current == null && v.currentTime >= 3 && now - lastSave.current > 5000) {
             lastSave.current = now
-            void api.saveProgress(mediaFileId, v.currentTime, Number.isFinite(v.duration) ? v.duration : null)
+            savePosition(v)
           }
-          // Autoplay popup + odpočet už během posledních AUTOPLAY_LEAD sekund (ne až po konci videa).
-          if (nextEpisode && !showNext && Number.isFinite(v.duration)
-              && v.currentTime > 0 && v.duration - v.currentTime <= AUTOPLAY_LEAD) {
-            setCountdown(Math.max(1, Math.ceil(v.duration - v.currentTime)))
-            setShowNext(true)
+          if (!endedCountdown && nextEpisode && !cancelledAutoplay.current && Number.isFinite(v.duration)) {
+            const remaining = v.duration - v.currentTime
+            if (remaining > AUTOPLAY_LEAD || remaining < 0 || v.currentTime <= 0) setShowNext(false)
+            else {
+              setCountdown(Math.max(1, Math.ceil(remaining)))
+              setShowNext(true)
+            }
+          }
+        }}
+        onSeeking={(e) => {
+          if (Number.isFinite(e.currentTarget.duration) &&
+              e.currentTarget.duration - e.currentTarget.currentTime > AUTOPLAY_LEAD) {
+            setShowNext(false)
+            setEndedCountdown(false)
           }
         }}
         onDurationChange={(e) => setDuration(e.currentTarget.duration)}
-        onVolumeChange={(e) => setVolume(e.currentTarget.volume)}
+        onVolumeChange={(e) => {
+          const v = e.currentTarget
+          setVolume(v.volume); setMuted(v.muted)
+          if (soundReady.current) {
+            const nextVolume = v.volume, nextMuted = v.muted
+            soundSaveQueue.current = soundSaveQueue.current
+              .then(async () => { await api.savePlayerSound(nextVolume, nextMuted) }).catch(() => undefined)
+          }
+        }}
         onEnded={handleEnded}
         style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
       >
@@ -365,6 +470,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
       {error && (
         <Box sx={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 2 }}>
           <Typography color="error">{error}</Typography>
+          <Button variant="outlined" onClick={() => { setProgressRetry((n) => n + 1); setLoadRetry((n) => n + 1); setError(null) }}>Zkusit znovu</Button>
           <Button variant="outlined" onClick={onClose}>Zpět</Button>
         </Box>
       )}
@@ -384,7 +490,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
               <Button variant="contained" startIcon={<SkipNextIcon />} onClick={playNext} sx={{ flex: 1 }}>
                 Přehrát teď
               </Button>
-              <Button variant="outlined" onClick={() => setShowNext(false)}>Zrušit</Button>
+              <Button variant="outlined" onClick={() => { cancelledAutoplay.current = true; setShowNext(false); setEndedCountdown(false) }}>Zrušit</Button>
             </Box>
           </Box>
         </Box>
@@ -429,7 +535,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
             max={duration || 1}
             onChange={(_e, v) => {
               const video = videoRef.current
-              if (video) video.currentTime = v as number
+              if (video && progressReady.current && metadataReady.current) video.currentTime = v as number
             }}
             sx={{
               color: 'primary.main', height: 4, p: '4px 0',
@@ -471,7 +577,9 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
               {formatTime(current)} / {formatTime(duration)}
             </Typography>
             <Box sx={{ flex: 1 }} />
-            <VolumeUpIcon sx={{ color: 'rgba(255,255,255,0.6)', fontSize: 20 }} />
+            <IconButton onClick={() => { if (videoRef.current) videoRef.current.muted = !videoRef.current.muted }} size="small" sx={{ color: '#fff' }}>
+              {muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
+            </IconButton>
             <Slider
               value={volume}
               min={0} max={1} step={0.05}
