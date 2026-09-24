@@ -69,9 +69,11 @@ public static class ProgressEndpoints
         }, ct);
     }
 
-    private static async Task<IResult> GetProgress(int mediaFileId, Guid? session, LibraryDbContext db,
+    private static async Task<IResult> GetProgress(int mediaFileId, Guid? session, long? sessionStartedAt, LibraryDbContext db,
         ProgressWriteCoordinator writers, CancellationToken ct)
     {
+        if (sessionStartedAt is <= 0 || (sessionStartedAt.HasValue && !session.HasValue))
+            return Results.BadRequest("Neplatný začátek přehrávání.");
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == mediaFileId, ct);
         if (file is null) return Results.NotFound();
 
@@ -79,7 +81,7 @@ public static class ProgressEndpoints
         {
             var progress = await db.PlaybackProgress.FirstOrDefaultAsync(p => p.Path == file.Path, ct);
             ct.ThrowIfCancellationRequested();
-            if (session is { } id && !state.Begin(id))
+            if (session is { } id && !state.Begin(id, sessionStartedAt))
                 return Results.Conflict("Toto přehrávání už bylo nahrazeno novějším.");
             return progress is null ? Results.NoContent()
                 : Results.Ok(new ProgressDto(progress.PositionSeconds, progress.DurationSeconds, progress.Finished));

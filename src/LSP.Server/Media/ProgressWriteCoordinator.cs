@@ -29,16 +29,21 @@ public sealed class ProgressWriteCoordinator
     {
         private Guid? _session;
         private long _sequence;
+        private long _sessionStartedAt;
         private bool _revoked;
         private readonly HashSet<Guid> _retired = [];
 
-        public bool Begin(Guid session)
+        public bool Begin(Guid session, long? startedAt = null)
         {
             if (session == Guid.Empty || _retired.Contains(session)) return false;
             if (_session == session) return !_revoked;
+            // A canceled read can arrive after the next player has already registered.
+            // Arrival order is therefore insufficient to identify the current writer.
+            if (_sessionStartedAt > 0 && (startedAt is null || startedAt <= _sessionStartedAt)) return false;
             if (_session is { } previous) _retired.Add(previous);
             _session = session;
             _sequence = 0;
+            _sessionStartedAt = startedAt ?? 0;
             _revoked = false;
             return true;
         }

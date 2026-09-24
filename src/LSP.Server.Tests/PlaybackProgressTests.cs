@@ -107,10 +107,32 @@ public sealed class PlaybackProgressTests
         Assert.Equal(25, (await final.PlaybackProgress.SingleAsync()).PositionSeconds);
     }
 
-    private static async Task<int?> Read(SqliteConnection connection, ProgressWriteCoordinator writers, int id, Guid session)
+    [Fact]
+    public async Task DelayedFirstReadOfOldPlayerCannotSupersedeNewPlayer()
+    {
+        await using var connection = await OpenAsync();
+        int id;
+        await using (var db = Context(connection))
+        {
+            var file = new MediaFile { Path = "race.mkv", FileName = "race.mkv", Extension = ".mkv" };
+            db.MediaFiles.Add(file);
+            await db.SaveChangesAsync();
+            id = file.Id;
+        }
+        var writers = new ProgressWriteCoordinator();
+        var current = Guid.NewGuid();
+        Assert.Equal(204, await Read(connection, writers, id, current, 2000));
+        Assert.Equal(409, await Read(connection, writers, id, Guid.NewGuid(), 1000));
+        Assert.Equal(409, await Read(connection, writers, id, Guid.NewGuid()));
+        Assert.Equal(204, await Save(connection, writers, new(id, 1500, 3600, current, 1)));
+        Assert.Equal(200, await Read(connection, writers, id, current, 2000));
+        Assert.Equal(409, await Save(connection, writers, new(id, 6, 3600, current, 1)));
+    }
+
+    private static async Task<int?> Read(SqliteConnection connection, ProgressWriteCoordinator writers, int id, Guid session, long? startedAt = null)
     {
         await using var db = Context(connection);
-        return ((IStatusCodeHttpResult)await Invoke("GetProgress", id, (Guid?)session, db, writers, CancellationToken.None)).StatusCode;
+        return ((IStatusCodeHttpResult)await Invoke("GetProgress", id, (Guid?)session, startedAt!, db, writers, CancellationToken.None)).StatusCode;
     }
 
     private static async Task<int?> Save(SqliteConnection connection, ProgressWriteCoordinator writers, SaveProgressRequest request)
