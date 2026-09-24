@@ -105,6 +105,7 @@ public sealed class SubtitleService(FfmpegLocator locator, ILogger<SubtitleServi
             return output;
 
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+        var tempOutput = Path.Combine(Path.GetDirectoryName(output)!, $"{Guid.NewGuid():N}.vtt");
 
         var psi = new ProcessStartInfo
         {
@@ -120,25 +121,41 @@ public sealed class SubtitleService(FfmpegLocator locator, ILogger<SubtitleServi
         psi.ArgumentList.Add("-i"); psi.ArgumentList.Add(videoPath);
         psi.ArgumentList.Add("-map"); psi.ArgumentList.Add($"0:s:{ordinal}");
         psi.ArgumentList.Add("-f"); psi.ArgumentList.Add("webvtt");
-        psi.ArgumentList.Add(output);
+        psi.ArgumentList.Add(tempOutput);
 
+        Process? proc = null;
         try
         {
-            using var proc = Process.Start(psi)!;
-            var stderr = await proc.StandardError.ReadToEndAsync(ct);
+            proc = Process.Start(psi) ?? throw new InvalidOperationException("ffmpeg se nespustil");
+            var stdout = proc.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = proc.StandardError.ReadToEndAsync(ct);
+            await stdout;
+            var stderr = await stderrTask;
             await proc.WaitForExitAsync(ct);
-            if (proc.ExitCode == 0 && File.Exists(output))
+            if (proc.ExitCode == 0 && File.Exists(tempOutput))
+            {
+                File.Move(tempOutput, output, overwrite: true);
                 return output;
+            }
 
             log.LogWarning("Extrakce titulků {Track} selhala: {Err}", track.Id, stderr);
-            TryDelete(output);
             return null;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            KillProcess(proc);
+            throw;
         }
         catch (Exception ex)
         {
+            KillProcess(proc);
             log.LogWarning(ex, "Extrakce titulků {Track} selhala", track.Id);
-            TryDelete(output);
             return null;
+        }
+        finally
+        {
+            proc?.Dispose();
+            TryDelete(tempOutput);
         }
     }
 
@@ -185,5 +202,11 @@ public sealed class SubtitleService(FfmpegLocator locator, ILogger<SubtitleServi
         {
             // Best effort cleanup of failed extraction output.
         }
+    }
+
+    private static void KillProcess(Process? proc)
+    {
+        try { if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true); }
+        catch { /* process may have exited concurrently */ }
     }
 }

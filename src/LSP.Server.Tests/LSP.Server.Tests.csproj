@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\LSP.Server\LSP.Server.csproj" />
+    <ProjectReference Include="..\LSP.ProcessFixture\LSP.ProcessFixture.csproj" />
     <None Update="portable.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
