@@ -31,7 +31,6 @@ public sealed class EnrichmentService(
 {
     private static readonly TimeSpan CacheTtl = TimeSpan.FromDays(180);
     private static readonly double AutoApplyThreshold = 0.85;
-    private static readonly double LlmChooseThreshold = 0.75; // pod tím rozhoduje LLM; 0.75–0.85 se aplikuje s review flagem
     private static readonly double ReviewThreshold = 0.60;
     private bool _forceRefresh;
 
@@ -66,7 +65,7 @@ public sealed class EnrichmentService(
         var aliases = await db.MatchAliases.ToListAsync(ct);
         var roots = await db.LibraryFolders.Select(f => f.Path).ToListAsync(ct);
 
-        int hits = 0, posters = 0, skipped = 0, reclassified = 0, reviewQueue = 0;
+        int hits = 0, posters = 0, skipped = 0, reclassified = 0;
         var showByTmdbId = new Dictionary<int, Show>();
         var pendingMovies = new Dictionary<string, List<Movie>>();  // itemKey → filmy sdílející stejný dotaz
         var movieChoiceKeys = new Dictionary<string, string>();     // queryKey → itemKey (dedup dotazů pro LLM)
@@ -121,14 +120,10 @@ public sealed class EnrichmentService(
             }
             else if (cached is not null && score >= ReviewThreshold)
             {
-                // 0.75–0.85: dost jistá shoda → aplikuj s review flagem; 0.60–0.75: ať vybere LLM.
-                if (score >= LlmChooseThreshold || !hasLlm ||
-                    !await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys, movie, movie.Title, movie.Year, candidates, roots, ct))
-                {
-                    ApplyToMovie(movie, cached);
-                    hits++;
-                    reviewQueue++;
-                }
+                // Nejistý kandidát zůstává návrhem; identitu smí potvrdit jen LLM z nabídky.
+                if (hasLlm)
+                    await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys,
+                        movie, movie.Title, movie.Year, candidates, roots, ct);
             }
             else
             {
@@ -142,13 +137,9 @@ public sealed class EnrichmentService(
                 }
                 else if (tvCached is not null && tvScore >= ReviewThreshold)
                 {
-                    if (tvScore >= LlmChooseThreshold || !hasLlm ||
-                        !await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys, movie, movie.Title, movie.Year, tvCandidates, roots, ct))
-                    {
-                        ApplyToMovie(movie, tvCached);
-                        hits++;
-                        reviewQueue++;
-                    }
+                    if (hasLlm)
+                        await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys,
+                            movie, movie.Title, movie.Year, tvCandidates, roots, ct);
                 }
             }
         }
@@ -201,17 +192,16 @@ public sealed class EnrichmentService(
                 continue; // show zůstává bez match → LLM (Fáze 3) nebo review
             }
 
-            // Slabší shoda (0.60–0.75): má-li LLM, ať vybere z kandidátů místo automatické aplikace.
-            if (score < LlmChooseThreshold && hasLlm &&
-                await TryQueuePendingShowChoiceAsync(chooseInputs, pendingShows, show, show.Title, candidates, roots, ct))
+            if (score < AutoApplyThreshold)
             {
+                if (hasLlm)
+                    await TryQueuePendingShowChoiceAsync(chooseInputs, pendingShows, show, show.Title, candidates, roots, ct);
                 continue;
             }
 
             ApplyToShow(show, cached);
             if (cached.PosterFile is not null) posters++;
             hits++;
-            if (score < AutoApplyThreshold) reviewQueue++;
 
             // Season API pro epizody
             await EnrichSeasonEpisodesAsync(show, cached.TmdbId!.Value, ct);
@@ -228,19 +218,17 @@ public sealed class EnrichmentService(
                 var input = chooseInputs[chooseIndex];
                 ct.ThrowIfCancellationRequested();
                 progress?.Report(new EnrichmentProgress(2.5, "LLM výběr", chooseIndex, chooseInputs.Count));
-                var groupSize = pendingMovies.TryGetValue(input.ItemKey, out var groupMovies) ? groupMovies.Count : 1;
+                pendingMovies.TryGetValue(input.ItemKey, out var groupMovies);
 
                 if (!choices.TryGetValue(input.ItemKey, out var choice) ||
                     choice.ItemKey != input.ItemKey || choice.ChosenTmdbId is not { } chosenId)
                 {
-                    reviewQueue += groupSize; // LLM řekl "žádný" nebo neodpověděl → zůstává bez TmdbId (review fronta)
                     continue;
                 }
 
                 if (!input.Candidates.Any(c => c.TmdbId == chosenId && c.MediaType == input.ExpectedKind))
                 {
                     log.LogWarning("LLM zvolilo nenabídnuté ID {Id} nebo nesprávný typ pro '{Key}'", chosenId, input.ItemKey);
-                    reviewQueue += groupSize;
                     continue;
                 }
 
@@ -249,7 +237,6 @@ public sealed class EnrichmentService(
                 {
                     log.LogWarning("TMDB detail neodpovídá vybrané identitě {Type}:{Id} pro '{Key}'",
                         input.ExpectedKind, chosenId, input.ItemKey);
-                    reviewQueue += groupSize;
                     continue;
                 }
 
@@ -278,13 +265,12 @@ public sealed class EnrichmentService(
         int llmFallbacks = 0, llmRecovered = 0;
         if (hasLlm)
         {
-            var missingMovies = await db.Movies
-                .Include(m => m.MediaFile)
-                .Where(m => !m.IsManual && m.TmdbId == null)
-                .ToListAsync(ct);
-            var missingShows = await db.Shows
-                .Where(s => !s.IsManual && s.TmdbId == null)
-                .ToListAsync(ct);
+            // SQL nevidí dosud neuložené změny ve sledovaných entitách. Zároveň znovu
+            // nezkoušej položky, u nichž LLM právě odmítl nabídnuté kandidáty.
+            var pendingMovieIds = pendingMovies.Values.SelectMany(group => group).Select(m => m.Id).ToHashSet();
+            var pendingShowIds = pendingShows.Values.Select(s => s.Id).ToHashSet();
+            var missingMovies = movies.Where(m => !m.IsManual && m.TmdbId is null && !pendingMovieIds.Contains(m.Id)).ToList();
+            var missingShows = shows.Where(s => !s.IsManual && s.TmdbId is null && !pendingShowIds.Contains(s.Id)).ToList();
 
             if (missingMovies.Count > 0 || missingShows.Count > 0)
             {
@@ -316,6 +302,7 @@ public sealed class EnrichmentService(
                         if (parsed.Kind == "episode" && parsed is { Season: { } se, Episode: { } ep })
                         {
                             var show = await ResolveShowAsync(showByTmdbId, parsed.Title, fetchPosters, ct);
+                            if (show is null) continue;
                             db.Episodes.Add(new Episode
                             {
                                 Show = show,
@@ -332,12 +319,12 @@ public sealed class EnrichmentService(
                         }
                         else
                         {
-                            movie.Title = parsed.Title;
-                            if (parsed.Year is not null) movie.Year = parsed.Year;
                             var (cached, score, _) = await TryTmdbMovieThenTvScoredAsync(parsed.Title, parsed.Year, "movie", fetchPosters, ct);
                             if (cached is not null && score >= AutoApplyThreshold)
                             {
                                 ApplyToMovie(movie, cached);
+                                movie.Title = parsed.Title;
+                                if (parsed.Year is not null) movie.Year = parsed.Year;
                                 if (cached.PosterFile is not null) posters++;
                                 llmRecovered++;
                             }
@@ -360,12 +347,11 @@ public sealed class EnrichmentService(
 
                         var show = missingShows[i];
                         var (cached, score, _) = await TryTmdbScoredAsync(parsed.Title, null, "tv", fetchPosters, ct);
-                        if (cached is not null && score >= ReviewThreshold)
+                        if (cached is not null && score >= AutoApplyThreshold)
                         {
                             ApplyToShow(show, cached);
                             if (cached.PosterFile is not null) posters++;
                             llmRecovered++;
-                            if (score < AutoApplyThreshold) reviewQueue++;
                             if (cached.TmdbId is { } tid)
                                 await EnrichSeasonEpisodesAsync(show, tid, ct);
                         }
@@ -392,6 +378,7 @@ public sealed class EnrichmentService(
         var finalMovieMisses = await db.Movies.CountAsync(m => !m.IsManual && m.TmdbId == null, ct);
         var finalShowMisses = await db.Shows.CountAsync(s => !s.IsManual && s.TmdbId == null, ct);
         var tmdbMisses = finalMovieMisses + finalShowMisses;
+        var reviewQueue = tmdbMisses;
 
         log.LogInformation(
             "Enrichment: {Hits} TMDB, {LLM}→{Rec}, {Recl} reclass, {Posters} posterů, {RQ} v review, {Miss} stále chybí ({Ms} ms)",
@@ -531,7 +518,7 @@ public sealed class EnrichmentService(
     /// Zařadí film s nejistou TMDB shodou do fronty pro LLM disambiguaci (Fáze 2.5).
     /// Stejný dotaz (titul|rok) se LLM posílá jen jednou — rozhodnutí se pak aplikuje na
     /// všechny soubory, které ho sdílejí. Vrací false (a nic nezařadí), když se nepodaří
-    /// sehnat kandidáty — volající pak aplikuje původní nejistou shodu rovnou.
+    /// sehnat kandidáty; položka pak zůstává nerozhodnutá ve frontě ke kontrole.
     /// </summary>
     private async Task<bool> TryQueuePendingMovieChoiceAsync(
         List<LlmChooseInput> chooseInputs, Dictionary<string, List<Movie>> pendingMovies,
@@ -728,11 +715,11 @@ public sealed class EnrichmentService(
         return variants;
     }
 
-    private async Task<Show> ResolveShowAsync(Dictionary<int, Show> byTmdbId, string llmTitle, bool fetchPosters, CancellationToken ct)
+    private async Task<Show?> ResolveShowAsync(Dictionary<int, Show> byTmdbId, string llmTitle, bool fetchPosters, CancellationToken ct)
     {
         var (cached, score, _) = await TryTmdbScoredAsync(llmTitle, null, "tv", fetchPosters, ct);
 
-        if (cached?.TmdbId is { } tmdbId)
+        if (score >= AutoApplyThreshold && cached?.TmdbId is { } tmdbId)
         {
             if (byTmdbId.TryGetValue(tmdbId, out var hit)) return hit;
             var existing = db.Shows.Local.FirstOrDefault(s => s.TmdbId == tmdbId)
@@ -741,14 +728,18 @@ public sealed class EnrichmentService(
 
             // Titul může kolidovat s jiným (zatím TMDB-nematchnutým) Show — unikátní index na Title.
             var byTitle = await FindShowByTitleAsync(cached.Title ?? llmTitle, ct);
-            if (byTitle is not null)
+            if (byTitle is { IsManual: false, TmdbId: null })
             {
                 ApplyToShow(byTitle, cached);
                 byTmdbId[tmdbId] = byTitle;
                 return byTitle;
             }
 
-            var show = new Show { Title = cached.Title ?? llmTitle };
+            // Unikátní Title nesmí spojit jiný přijatý nebo ručně chráněný seriál.
+            var title = cached.Title ?? llmTitle;
+            if (byTitle is not null)
+                title = await UniqueShowTitleAsync($"{title} (TMDB {tmdbId})", ct);
+            var show = new Show { Title = title };
             db.Shows.Add(show);
             ApplyToShow(show, cached);
             byTmdbId[tmdbId] = show;
@@ -756,11 +747,20 @@ public sealed class EnrichmentService(
         }
 
         var fallbackExisting = await FindShowByTitleAsync(llmTitle, ct);
-        if (fallbackExisting is not null) return fallbackExisting;
+        if (fallbackExisting is not null)
+            return fallbackExisting is { IsManual: false, TmdbId: null } ? fallbackExisting : null;
 
         var fallback = new Show { Title = llmTitle };
         db.Shows.Add(fallback);
         return fallback;
+    }
+
+    private async Task<string> UniqueShowTitleAsync(string baseTitle, CancellationToken ct)
+    {
+        var title = baseTitle;
+        for (var suffix = 2; await FindShowByTitleAsync(title, ct) is not null; suffix++)
+            title = $"{baseTitle} ({suffix})";
+        return title;
     }
 
     /// <summary>
