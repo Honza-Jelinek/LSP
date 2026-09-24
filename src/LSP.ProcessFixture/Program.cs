@@ -9,7 +9,9 @@ public static class Program
         var marker = args.Last();
         // Fill the pipe before announcing readiness; callers must drain stderr concurrently.
         await Console.Error.WriteAsync(new string('x', 200_000));
-        await File.WriteAllTextAsync(marker, Environment.ProcessId.ToString());
+        var temp = marker + ".tmp";
+        await File.WriteAllTextAsync(temp, Environment.ProcessId.ToString());
+        File.Move(temp, marker);
         await Task.Delay(Timeout.InfiniteTimeSpan);
     }
 }

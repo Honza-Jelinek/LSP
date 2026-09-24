@@ -18,9 +18,9 @@ public sealed class FfprobeCancellationTests
         var service = new FfprobeService(locator, NullLogger<FfprobeService>.Instance);
         var marker = Path.Combine(Path.GetTempPath(), $"lsp-probe-{Guid.NewGuid():N}.pid");
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var operation = service.ProbeAsync(marker, cts.Token);
         try
         {
-            var operation = service.ProbeAsync(marker, cts.Token);
             var deadline = DateTime.UtcNow.AddSeconds(10);
             while (!File.Exists(marker) && DateTime.UtcNow < deadline)
                 await Task.Delay(30);
@@ -35,7 +35,13 @@ public sealed class FfprobeCancellationTests
                 await Task.Delay(30);
             Assert.False(IsRunning(pid));
         }
-        finally { if (File.Exists(marker)) File.Delete(marker); }
+        finally
+        {
+            cts.Cancel();
+            try { await operation; }
+            catch (OperationCanceledException) { }
+            if (File.Exists(marker)) File.Delete(marker);
+        }
     }
 
     private static bool IsRunning(int pid)
