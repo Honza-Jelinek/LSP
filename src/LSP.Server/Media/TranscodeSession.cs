@@ -39,7 +39,15 @@ public sealed class TranscodeSession : IDisposable
     private int _generation;
     private bool _disposed;
     private bool _paused;
+    private TaskCompletionSource _resumeSignal = CompletedSignal();
     private string? _selectedEncoder;
+
+    private static TaskCompletionSource CompletedSignal()
+    {
+        var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        signal.SetResult();
+        return signal;
+    }
 
     private sealed class PendingWork(CancellationTokenSource cancellation)
     {
@@ -73,7 +81,9 @@ public sealed class TranscodeSession : IDisposable
         {
             if (_disposed) return;
             if (paused && !_paused)
-                InvalidateGeneration(clearCache: false);
+                _resumeSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            else if (!paused && _paused)
+                _resumeSignal.TrySetResult();
             _paused = paused;
             Touch();
         }
@@ -127,28 +137,37 @@ public sealed class TranscodeSession : IDisposable
         var boundaries = await GetBoundariesAsync(ct);
         if (index < 0 || index >= boundaries.Length - 1) return null;
         PendingWork work;
-        lock (_sync)
+        while (true)
         {
-            if (_disposed) return null;
-            Touch();
-            _paused = false;
-            var path = SegPath(index);
-            if (File.Exists(path))
+            Task? waitForResume = null;
+            lock (_sync)
             {
-                _cached[index] = DateTimeOffset.UtcNow;
-                return path;
+                if (_disposed) return null;
+                Touch();
+                var path = SegPath(index);
+                if (File.Exists(path))
+                {
+                    _cached[index] = DateTimeOffset.UtcNow;
+                    return path;
+                }
+                if (_paused)
+                    waitForResume = _resumeSignal.Task;
+                else
+                {
+                    if (!_pending.TryGetValue(index, out work!))
+                    {
+                        var generation = _generation;
+                        work = new PendingWork(CancellationTokenSource.CreateLinkedTokenSource(_generationCancellation.Token));
+                        _pending[index] = work;
+                        // Publish before execution so synchronous completion cannot remove an unstored item.
+                        work.Task = Task.Run(() => ProduceAsync(index, boundaries[index], boundaries[index + 1],
+                            generation, work, work.Cancellation.Token));
+                    }
+                    work.Waiters++;
+                    break;
+                }
             }
-            if (!_pending.TryGetValue(index, out work!))
-            {
-                var generation = _generation;
-                work = new PendingWork(CancellationTokenSource.CreateLinkedTokenSource(_generationCancellation.Token));
-                _pending[index] = work;
-                // Schedule only after publishing the work item. This also avoids synchronous
-                // completion removing an item before the caller stores it.
-                work.Task = Task.Run(() => ProduceAsync(index, boundaries[index], boundaries[index + 1],
-                    generation, work, work.Cancellation.Token));
-            }
-            work.Waiters++;
+            await waitForResume!.WaitAsync(ct);
         }
         try { return await work.Task.WaitAsync(ct); }
         finally
@@ -432,6 +451,7 @@ public sealed class TranscodeSession : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            _resumeSignal.TrySetResult();
             pending = _pending.Values.Select(p => p.Task).ToArray();
             InvalidateGeneration(clearCache: true);
         }
