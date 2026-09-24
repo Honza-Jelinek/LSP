@@ -58,4 +58,6 @@ public sealed class SettingsService(LibraryDbContext db)
     public const string FetchGenres = "tmdb.fetch.genres";
     public const string FetchCast = "tmdb.fetch.cast";
     public const string PlayerAudioLanguage = "player.audioLanguage";
+    public const string PlayerVolume = "player.volume";
+    public const string PlayerMuted = "player.muted";
 }

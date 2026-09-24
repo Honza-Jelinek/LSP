@@ -13,6 +13,7 @@ namespace LSP.Server.Api;
 public sealed record LibraryFolderDto(int Id, string Path);
 public sealed record AddLibraryFolderRequest(string Path);
 public sealed record SavePlayerAudioLanguageRequest(string? Language);
+public sealed record PlayerSoundDto(double Volume, bool Muted);
 
 public sealed record ConfigDto(
     bool HasTmdbKey,
@@ -51,6 +52,8 @@ public static class SettingsEndpoints
         app.MapGet("/api/settings/config", GetConfig);
         app.MapPut("/api/settings/config", SaveConfig);
         app.MapPut("/api/settings/player/audio-language", SavePlayerAudioLanguage);
+        app.MapGet("/api/settings/player/sound", GetPlayerSound);
+        app.MapPut("/api/settings/player/sound", SavePlayerSound);
         app.MapPost("/api/settings/clear-library", ClearLibrary);
     }
 
@@ -64,6 +67,26 @@ public static class SettingsEndpoints
         else
             await settings.SetAsync(SettingsService.PlayerAudioLanguage, normalized, ct);
 
+        return Results.NoContent();
+    }
+
+    private static async Task<IResult> GetPlayerSound(SettingsService settings, CancellationToken ct)
+    {
+        var raw = await settings.GetAsync(SettingsService.PlayerVolume, ct);
+        var volume = double.TryParse(raw, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var parsed) && double.IsFinite(parsed)
+            ? Math.Clamp(parsed, 0, 1) : 1;
+        return Results.Ok(new PlayerSoundDto(volume,
+            await settings.GetBoolAsync(SettingsService.PlayerMuted, false, ct)));
+    }
+
+    private static async Task<IResult> SavePlayerSound(PlayerSoundDto sound, SettingsService settings, CancellationToken ct)
+    {
+        if (!double.IsFinite(sound.Volume) || sound.Volume is < 0 or > 1)
+            return Results.BadRequest("Hlasitost musí být mezi 0 a 1.");
+        await settings.SetAsync(SettingsService.PlayerVolume,
+            sound.Volume.ToString(System.Globalization.CultureInfo.InvariantCulture), ct);
+        await settings.SetAsync(SettingsService.PlayerMuted, sound.Muted.ToString(), ct);
         return Results.NoContent();
     }
 
