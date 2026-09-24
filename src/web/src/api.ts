@@ -294,16 +294,19 @@ export const api = {
     return fetch(`/api/stream/${mediaFileId}/info?${qs}`).then(json<StreamInfo>)
   },
 
-  saveProgress: (mediaFileId: number, positionSeconds: number, durationSeconds: number | null, sessionId?: string, sequence?: number) =>
+  saveProgress: (mediaFileId: number, positionSeconds: number, durationSeconds: number | null, sessionId?: string, sequence?: number, keepalive = false) =>
     fetch('/api/progress', {
       method: 'POST',
+      keepalive,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mediaFileId, positionSeconds, durationSeconds, sessionId, sequence }),
     }).then(ensureOk),
 
-  getProgress: async (mediaFileId: number, sessionId?: string): Promise<Progress | null> => {
-    const query = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
-    const res = await fetch(`/api/progress/${mediaFileId}${query}`)
+  getProgress: async (mediaFileId: number, sessionId?: string, sessionStartedAt?: number, signal?: AbortSignal): Promise<Progress | null> => {
+    const query = new URLSearchParams()
+    if (sessionId) query.set('session', sessionId)
+    if (sessionStartedAt != null) query.set('sessionStartedAt', String(sessionStartedAt))
+    const res = await fetch(`/api/progress/${mediaFileId}?${query}`, { signal })
     if (res.status === 204) return null
     if (!res.ok) throw new Error(`Načtení uložené pozice selhalo (${res.status}).`)
     return res.json() as Promise<Progress>

@@ -46,14 +46,22 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   const hideTimer = useRef<number | undefined>(undefined)
   const resumeTo = useRef<number | null>(null)
   const playWhenReady = useRef(true)
-  const playbackSession = useRef({ mediaFileId, id: crypto.randomUUID(), sequence: 0 })
+  const playbackSession = useRef({ mediaFileId, id: crypto.randomUUID(),
+    startedAt: Math.round((performance.timeOrigin + performance.now()) * 1000), sequence: 0 })
   if (playbackSession.current.mediaFileId !== mediaFileId)
-    playbackSession.current = { mediaFileId, id: crypto.randomUUID(), sequence: 0 }
+    playbackSession.current = { mediaFileId, id: crypto.randomUUID(),
+      startedAt: Math.round((performance.timeOrigin + performance.now()) * 1000), sequence: 0 }
   const progressReady = useRef(false)
   const metadataReady = useRef(false)
   const soundReady = useRef(false)
+  const resumeSeekPending = useRef(false)
   const streamSession = useRef<string | null>(null)
   const streamMode = useRef<'direct' | 'hls' | null>(null)
+  const activeHls = useRef<Hls | null>(null)
+  const hlsLoadingPaused = useRef(false)
+  const streamPaused = useRef(false)
+  const sendStreamHeartbeat = useRef<((paused: boolean, position: number) => void) | null>(null)
+  const lastSavedPosition = useRef<{ position: number; keepalive: boolean } | null>(null)
   const soundSaveQueue = useRef<Promise<void>>(Promise.resolve())
   const cancelledAutoplay = useRef(false)
   // Inicializace na "teď" → první throttlované uložení proběhne až po ~5 s, ne hned na pozici 0.
@@ -88,28 +96,57 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     cancelledAutoplay.current = false
     progressReady.current = false
     metadataReady.current = false
+    resumeSeekPending.current = false
+    lastSavedPosition.current = null
   }, [mediaFileId])
 
   const startIfReady = useCallback(() => {
     const video = videoRef.current
-    if (!video || !progressReady.current || !metadataReady.current || !soundReady.current) return
+    if (!video || !progressReady.current || !metadataReady.current || !soundReady.current || resumeSeekPending.current) return
     if (resumeTo.current != null) {
       const target = resumeTo.current
-      if (Number.isFinite(video.duration) && target < video.duration - 10)
-        video.currentTime = Math.max(0, target)
+      const clamped = Math.max(0, Number.isFinite(video.duration)
+        ? Math.min(target, Math.max(0, video.duration - 0.25)) : target)
       resumeTo.current = null
+      if (Math.abs(video.currentTime - clamped) > 0.25) {
+        resumeSeekPending.current = true
+        video.currentTime = clamped
+        if (video.seeking) return
+        resumeSeekPending.current = false
+      }
     }
     if (playWhenReady.current) void video.play().catch(() => setPlaying(false))
-    else { video.pause(); setPlaying(false) }
+    else {
+      video.pause()
+      if (activeHls.current) { activeHls.current.stopLoad(); hlsLoadingPaused.current = true }
+      streamPaused.current = true
+      sendStreamHeartbeat.current?.(true, video.currentTime)
+      setPlaying(false)
+    }
   }, [])
+
+  const savePosition = useCallback((video: HTMLVideoElement | null, keepalive = false) => {
+    if (!video || !progressReady.current || !metadataReady.current || resumeSeekPending.current
+        || resumeTo.current != null || video.currentTime < 3) return
+    const session = playbackSession.current
+    if (session.mediaFileId !== mediaFileId) return
+    const position = video.currentTime
+    const previous = lastSavedPosition.current
+    if (previous && Math.abs(previous.position - position) < 0.01 && (previous.keepalive || !keepalive)) return
+    lastSavedPosition.current = { position, keepalive }
+    const sequence = ++session.sequence
+    void api.saveProgress(mediaFileId, position,
+      Number.isFinite(video.duration) ? video.duration : null, session.id, sequence, keepalive)
+      .catch(() => undefined)
+  }, [mediaFileId])
 
   useEffect(() => {
     let cancelled = false
-    soundReady.current = false
+    const abort = new AbortController()
     progressReady.current = false
     setError(null)
-    const session = playbackSession.current.id
-    void api.getProgress(mediaFileId, session).then((p) => {
+    const { id: session, startedAt } = playbackSession.current
+    void api.getProgress(mediaFileId, session, startedAt, abort.signal).then((p) => {
       if (cancelled || playbackSession.current.id !== session) return
       if (!fromStart && p && !p.finished && p.positionSeconds > 5)
         resumeTo.current = p.positionSeconds
@@ -118,11 +155,12 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     }).catch((e: unknown) => {
       if (!cancelled) setError(`Uloženou pozici nelze načíst: ${String(e)}`)
     })
-    return () => { cancelled = true }
+    return () => { cancelled = true; abort.abort() }
   }, [mediaFileId, fromStart, progressRetry, startIfReady])
 
   useEffect(() => {
     let cancelled = false
+    soundReady.current = false
     void api.getPlayerSound().then((sound) => {
       if (cancelled) return
       const video = videoRef.current
@@ -150,9 +188,19 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   useEffect(() => {
     let hls: Hls | null = null
     let cancelled = false
+    let heartbeatQueue = Promise.resolve()
+    const sendHeartbeat = (paused: boolean, position: number) => {
+      heartbeatQueue = heartbeatQueue.then(async () => {
+        if (!cancelled && streamMode.current === 'hls')
+          await api.heartbeatStream(mediaFileId, session, paused, position)
+      }).catch(() => undefined)
+    }
     const session = crypto.randomUUID()
+    sendStreamHeartbeat.current = sendHeartbeat
     streamSession.current = session
     streamMode.current = null
+    streamPaused.current = false
+    hlsLoadingPaused.current = false
     const videoAtStart = videoRef.current
     metadataReady.current = false
     setBuffering(true)
@@ -160,11 +208,11 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     const heartbeat = () => {
       const video = videoAtStart
       if (!cancelled && video && streamMode.current === 'hls')
-        void api.heartbeatStream(mediaFileId, session, video.paused || video.readyState < 3,
-          Number.isFinite(video.currentTime) ? video.currentTime : 0).catch(() => undefined)
+        sendHeartbeat(streamPaused.current, Number.isFinite(video.currentTime) ? video.currentTime : 0)
     }
     const heartbeatTimer = window.setInterval(heartbeat, 10000)
-    window.addEventListener('pagehide', release)
+    const onPageHide = () => { savePosition(videoAtStart, true); release() }
+    window.addEventListener('pagehide', onPageHide)
 
     api
       .getStreamInfo(mediaFileId, selectedAudioOrdinal, session)
@@ -183,6 +231,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
             fragLoadingMaxRetry: 8,
             maxBufferLength: 30,
           })
+          activeHls.current = hls
           hls.loadSource(streamInfo.url)
           hls.attachMedia(video)
           hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -199,14 +248,19 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     return () => {
       cancelled = true
       window.clearInterval(heartbeatTimer)
-      window.removeEventListener('pagehide', release)
+      window.removeEventListener('pagehide', onPageHide)
+      savePosition(videoAtStart, true)
       hls?.destroy()
+      if (activeHls.current === hls) activeHls.current = null
+      hlsLoadingPaused.current = false
       if (videoAtStart) { videoAtStart.pause(); videoAtStart.removeAttribute('src'); videoAtStart.load() }
       release()
       if (streamSession.current === session) streamSession.current = null
+      if (sendStreamHeartbeat.current === sendHeartbeat) sendStreamHeartbeat.current = null
       streamMode.current = null
+      streamPaused.current = false
     }
-  }, [mediaFileId, selectedAudioOrdinal, loadRetry])
+  }, [mediaFileId, selectedAudioOrdinal, loadRetry, savePosition])
 
   const showControlsTemporarily = useCallback(() => {
     setControlsVisible(true)
@@ -218,14 +272,14 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current
-    if (!video || !progressReady.current || !soundReady.current || !metadataReady.current) return
+    if (!video || !progressReady.current || !soundReady.current || !metadataReady.current || resumeSeekPending.current) return
     if (video.paused) void video.play()
     else video.pause()
   }, [])
 
   const seekBy = useCallback((seconds: number) => {
     const video = videoRef.current
-    if (!video || !progressReady.current || !metadataReady.current) return
+    if (!video || !progressReady.current || !metadataReady.current || resumeSeekPending.current) return
     const durationLimit = Number.isFinite(video.duration) ? video.duration : Number.POSITIVE_INFINITY
     video.currentTime = Math.max(0, Math.min(durationLimit, video.currentTime + seconds))
     showControlsTemporarily()
@@ -254,23 +308,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
     setTrackMenuAnchor(null)
   }, [])
 
-  const savePosition = useCallback((video: HTMLVideoElement | null) => {
-    if (!video || !progressReady.current || resumeTo.current != null || video.currentTime < 3) return
-    const session = playbackSession.current
-    if (session.mediaFileId !== mediaFileId) return
-    const sequence = ++session.sequence
-    void api.saveProgress(mediaFileId, video.currentTime,
-      Number.isFinite(video.duration) ? video.duration : null, session.id, sequence)
-      .catch(() => undefined)
-  }, [mediaFileId])
-
   const saveNow = useCallback(() => savePosition(videoRef.current), [savePosition])
-
-  // Ulož pozici při zavření přehrávače.
-  useEffect(() => {
-    const video = videoRef.current
-    return () => savePosition(video)
-  }, [savePosition])
 
   // Při odmountování vždy vypni fullscreen (idempotentní) — jinak okno zůstane
   // zaseknuté ve fullscreenu bez klávesových zkratek, které žily jen tady.
@@ -281,15 +319,13 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
 
   const playNext = useCallback(() => {
     if (!nextEpisode) return
-    saveNow()
     onPlayNext?.(nextEpisode)
-  }, [nextEpisode, onPlayNext, saveNow])
+  }, [nextEpisode, onPlayNext])
 
   const playPrevious = useCallback(() => {
     if (!previousEpisode) return
-    saveNow()
     onPlayPrevious?.(previousEpisode)
-  }, [previousEpisode, onPlayPrevious, saveNow])
+  }, [previousEpisode, onPlayPrevious])
 
   const handleEnded = useCallback(() => {
     saveNow()
@@ -392,17 +428,34 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
       <video
         ref={videoRef}
         onClick={togglePlay}
-        onPlay={() => { setPlaying(true); showControlsTemporarily() }}
+        onPlay={(e) => {
+          streamPaused.current = false
+          if (streamSession.current && streamMode.current === 'hls')
+            sendStreamHeartbeat.current?.(false, e.currentTarget.currentTime)
+          if (hlsLoadingPaused.current) {
+            activeHls.current?.startLoad(e.currentTarget.currentTime)
+            hlsLoadingPaused.current = false
+          }
+          setPlaying(true); showControlsTemporarily()
+        }}
         onPause={(e) => {
+          streamPaused.current = true
+          if (activeHls.current) {
+            activeHls.current.stopLoad()
+            hlsLoadingPaused.current = true
+          }
           setPlaying(false); setControlsVisible(true); savePosition(e.currentTarget)
           if (streamSession.current && streamMode.current === 'hls')
-            void api.heartbeatStream(mediaFileId, streamSession.current, true, e.currentTarget.currentTime).catch(() => undefined)
+            sendStreamHeartbeat.current?.(true, e.currentTarget.currentTime)
         }}
         onWaiting={() => setBuffering(true)}
         onPlaying={(e) => {
           setBuffering(false)
-          if (streamSession.current && streamMode.current === 'hls')
-            void api.heartbeatStream(mediaFileId, streamSession.current, false, e.currentTarget.currentTime).catch(() => undefined)
+          if (!e.currentTarget.paused) {
+            streamPaused.current = false
+            if (streamSession.current && streamMode.current === 'hls')
+              sendStreamHeartbeat.current?.(false, e.currentTarget.currentTime)
+          }
         }}
         onLoadedMetadata={(e) => {
           const v = e.currentTarget
@@ -410,13 +463,32 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
           metadataReady.current = true
           startIfReady()
         }}
+        onSeeked={(e) => {
+          if (e.currentTarget.paused && activeHls.current) {
+            activeHls.current.stopLoad()
+            hlsLoadingPaused.current = true
+            streamPaused.current = true
+            if (streamSession.current)
+              sendStreamHeartbeat.current?.(true, e.currentTarget.currentTime)
+          }
+          if (resumeSeekPending.current) {
+            resumeSeekPending.current = false
+            startIfReady()
+          }
+          setCurrent(e.currentTarget.currentTime)
+        }}
         onTimeUpdate={(e) => {
           const v = e.currentTarget
+          if (resumeSeekPending.current && !v.seeking && resumeTo.current == null) {
+            resumeSeekPending.current = false
+            startIfReady()
+          }
           setCurrent(v.currentTime)
           const now = Date.now()
-          if (progressReady.current && resumeTo.current == null && v.currentTime >= 3 && now - lastSave.current > 5000) {
-            lastSave.current = now
+          if (progressReady.current && metadataReady.current && !resumeSeekPending.current
+              && resumeTo.current == null && v.currentTime >= 3 && now - lastSave.current > 5000) {
             savePosition(v)
+            lastSave.current = now
           }
           if (!endedCountdown && nextEpisode && !cancelledAutoplay.current && Number.isFinite(v.duration)) {
             const remaining = v.duration - v.currentTime
@@ -428,6 +500,13 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
           }
         }}
         onSeeking={(e) => {
+          if (e.currentTarget.paused && activeHls.current) {
+            streamPaused.current = false
+            if (streamSession.current)
+              sendStreamHeartbeat.current?.(false, e.currentTarget.currentTime)
+            activeHls.current.startLoad(e.currentTarget.currentTime)
+            hlsLoadingPaused.current = false
+          }
           if (Number.isFinite(e.currentTarget.duration) &&
               e.currentTarget.duration - e.currentTarget.currentTime > AUTOPLAY_LEAD) {
             setShowNext(false)
@@ -535,7 +614,7 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
             max={duration || 1}
             onChange={(_e, v) => {
               const video = videoRef.current
-              if (video && progressReady.current && metadataReady.current) video.currentTime = v as number
+              if (video && progressReady.current && metadataReady.current && !resumeSeekPending.current) video.currentTime = v as number
             }}
             sx={{
               color: 'primary.main', height: 4, p: '4px 0',
