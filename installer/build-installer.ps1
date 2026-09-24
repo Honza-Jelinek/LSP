@@ -3,9 +3,15 @@ $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 Set-Location $projectRoot
 
-$version = if ($env:LSP_INSTALLER_VERSION) { $env:LSP_INSTALLER_VERSION } else { "0.1.0" }
+$version = if ($env:LSP_INSTALLER_VERSION) { $env:LSP_INSTALLER_VERSION } else { "0.1.1" }
 $publishDir = Join-Path $projectRoot "artifacts\publish\LSP"
 $installerDir = Join-Path $projectRoot "artifacts\installer"
+$ffmpegDir = if ($env:LSP_FFMPEG_DIRECTORY) { $env:LSP_FFMPEG_DIRECTORY } else { Join-Path $projectRoot "tools\ffmpeg\win-x64" }
+foreach ($tool in @("ffmpeg.exe", "ffprobe.exe")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $ffmpegDir $tool) -PathType Leaf)) {
+        throw "Missing $tool in $ffmpegDir. Set LSP_FFMPEG_DIRECTORY to the directory containing the tested FFmpeg tools."
+    }
+}
 
 function Resolve-InnoSetupCompiler {
     $fromPath = Get-Command iscc -ErrorAction SilentlyContinue
@@ -55,6 +61,11 @@ dotnet publish "src\LSP.App\LSP.App.csproj" `
 if ($LASTEXITCODE -ne 0) {
     throw "Dotnet publish failed with exit code $LASTEXITCODE."
 }
+
+# The installed application must use the same tools as the tested build, not an unrelated PATH version.
+$bundledFfmpegDir = Join-Path $publishDir "ffmpeg\win-x64"
+New-Item -ItemType Directory -Force -Path $bundledFfmpegDir | Out-Null
+Get-ChildItem -LiteralPath $ffmpegDir -File | Copy-Item -Destination $bundledFfmpegDir -Force
 
 $iscc = Resolve-InnoSetupCompiler
 if (-not $iscc) {

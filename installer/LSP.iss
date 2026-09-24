@@ -3,7 +3,7 @@
 #define MyAppExeName "LSP.exe"
 #define MyAppVersion GetEnv("LSP_INSTALLER_VERSION")
 #if MyAppVersion == ""
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.1"
 #endif
 
 [Setup]
