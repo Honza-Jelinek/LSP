@@ -9,6 +9,7 @@ namespace LSP.Server.Api;
 
 public sealed record StreamInfoDto(
     int MediaFileId,
+    Guid? SessionId,
     string Mode,            // "direct" | "hls"
     string Url,             // co má frontend načíst
     double? DurationSeconds,
@@ -18,6 +19,8 @@ public sealed record StreamInfoDto(
     int? SelectedAudioOrdinal,
     string? SelectedAudioLanguage,
     IReadOnlyList<SubtitleTrackDto> SubtitleTracks);
+
+public sealed record StreamHeartbeatRequest(bool Paused, double PositionSeconds);
 
 public sealed record AudioTrackDto(
     int Ordinal,
@@ -54,17 +57,26 @@ public static class StreamEndpoints
         group.MapGet("/{id:int}/hls/{segment}", GetSegment);
         group.MapGet("/{id:int}/subtitles/{trackId}.vtt", GetSubtitle);
         group.MapDelete("/{id:int}/segments", PurgeSegments);
+        group.MapPost("/{id:int}/heartbeat", Heartbeat);
     }
 
     /// <summary>Zahodí transkód relaci a smaže segmenty daného souboru (volá se při přepnutí na jinou epizodu).</summary>
-    private static IResult PurgeSegments(int id, TranscodeSessionManager sessions)
+    private static IResult PurgeSegments(int id, Guid? session, TranscodeSessionManager sessions)
     {
-        sessions.PurgeSegments(id);
+        if (session is { } token) sessions.Release(id, token);
+        else sessions.PurgeSegments(id);
         return Results.NoContent();
     }
 
+    private static IResult Heartbeat(int id, Guid? session, StreamHeartbeatRequest request, TranscodeSessionManager sessions)
+    {
+        if (!double.IsFinite(request.PositionSeconds) || request.PositionSeconds < 0)
+            return Results.BadRequest();
+        return sessions.Touch(id, session, request.Paused) ? Results.NoContent() : Results.NotFound();
+    }
+
     private static async Task<IResult> GetInfo(
-        int id, int? audio, LibraryDbContext db, FfprobeService ffprobe, SettingsService settings, SubtitleService subtitles, CancellationToken ct)
+        int id, int? audio, Guid? session, LibraryDbContext db, FfprobeService ffprobe, SettingsService settings, SubtitleService subtitles, CancellationToken ct)
     {
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == id, ct);
         if (file is null) return Results.NotFound();
@@ -78,17 +90,17 @@ public static class StreamEndpoints
 
         var preferredLanguage = await settings.GetAsync(SettingsService.PlayerAudioLanguage, ct);
         var selectedAudio = AudioTrackSelector.Select(probe.AudioTracks, audio, preferredLanguage);
-        var plan = StreamingPlanner.Plan(file.Extension, probe);
+        var plan = StreamingPlanner.Plan(file.Extension, ForSelectedAudio(probe, selectedAudio));
         if (selectedAudio?.Ordinal > 0 && plan.Mode == PlaybackMode.Direct)
             plan = plan with { Mode = PlaybackMode.Hls };
 
         var url = plan.Mode == PlaybackMode.Direct
             ? $"/api/stream/{id}/direct"
-            : $"/api/stream/{id}/hls/index.m3u8?audio={selectedAudio?.Ordinal ?? 0}";
+            : $"/api/stream/{id}/hls/index.m3u8?audio={selectedAudio?.Ordinal ?? 0}{SessionQuery(session)}";
 
         return Results.Ok(new StreamInfoDto(
-            id, plan.Mode == PlaybackMode.Direct ? "direct" : "hls", url,
-            probe.DurationSeconds, probe.VideoCodec, probe.AudioCodec,
+            id, session, plan.Mode == PlaybackMode.Direct ? "direct" : "hls", url,
+            probe.DurationSeconds, probe.VideoCodec, selectedAudio?.Codec ?? probe.AudioCodec,
             probe.AudioTracks.Select(ToDto).ToList(),
             selectedAudio?.Ordinal,
             selectedAudio?.NormalizedLanguage,
@@ -104,36 +116,46 @@ public static class StreamEndpoints
     }
 
     private static async Task<IResult> GetPlaylist(
-        int id, int? audio, LibraryDbContext db, FfprobeService ffprobe, TranscodeSessionManager sessions, CancellationToken ct)
+        int id, int? audio, Guid? session, LibraryDbContext db, FfprobeService ffprobe, TranscodeSessionManager sessions, CancellationToken ct)
     {
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == id, ct);
         if (file is null || !File.Exists(file.Path)) return Results.NotFound();
 
         await EnsureProbedAsync(db, ffprobe, file, ct);
-        if (file.DurationSeconds is not > 0)
-            return Results.Problem("Neznámá délka videa – nelze sestavit HLS playlist.");
-
-        var probe = new MediaProbe(
+        var liveProbe = await ffprobe.ProbeAsync(file.Path, ct);
+        var probe = liveProbe ?? new MediaProbe(
             file.Container, file.VideoCodec, file.AudioCodec, file.DurationSeconds, file.Width, file.Height, [], []);
-        var plan = StreamingPlanner.Plan(file.Extension, probe);
+        var duration = probe.DurationSeconds ?? file.DurationSeconds;
+        if (duration is not > 0)
+            return Results.Problem("Neznámá délka videa – nelze sestavit HLS playlist.");
+        var selectedAudio = probe.AudioTracks.FirstOrDefault(t => t.Ordinal == (audio ?? 0));
+        if (audio is < 0 || (audio is > 0 && selectedAudio is null)
+            || (audio is not null && probe.AudioTracks.Count > 0 && selectedAudio is null))
+            return Results.BadRequest("Neplatná zvuková stopa.");
+        var plan = StreamingPlanner.Plan(file.Extension, ForSelectedAudio(probe, selectedAudio));
 
         // Založ relaci (ffmpeg se rozjede až na první žádost o segment) a vrať VOD playlist z délky.
-        var session = sessions.GetOrCreate(id, file.Path, plan, file.DurationSeconds.Value);
-        session.SetAudio(Math.Max(0, audio ?? 0));
-        return Results.Text(BuildVodPlaylist(file.DurationSeconds.Value), "application/vnd.apple.mpegurl");
+        var transcode = sessions.GetOrCreate(id, file.Path, plan, duration.Value, session, probe);
+        if (transcode is null) return Results.StatusCode(StatusCodes.Status410Gone);
+        transcode.SetAudio(audio ?? 0);
+        var playlist = await transcode.GetPlaylistAsync(ct);
+        // Playlist segment URIs carry the same playback generation as the index URL.
+        if (session is { } token)
+            playlist = System.Text.RegularExpressions.Regex.Replace(playlist, @"(?m)^(seg\d+\.ts)$", $"$1?session={token:D}");
+        return Results.Text(playlist, "application/vnd.apple.mpegurl");
     }
 
     private static async Task<IResult> GetSegment(
-        int id, string segment, TranscodeSessionManager sessions, CancellationToken ct)
+        int id, string segment, Guid? session, TranscodeSessionManager sessions, CancellationToken ct)
     {
-        var session = sessions.TryGet(id);
-        if (session is null) return Results.NotFound();
+        var transcode = sessions.TryGet(id, session);
+        if (transcode is null) return Results.NotFound();
 
         var name = Path.GetFileNameWithoutExtension(segment); // "seg00012"
         if (!name.StartsWith("seg", StringComparison.Ordinal) || !int.TryParse(name.AsSpan(3), out var index))
             return Results.NotFound();
 
-        var path = await session.GetSegmentAsync(index, ct);
+        var path = await transcode.GetSegmentAsync(index, ct);
         if (path is null) return Results.NotFound();
 
         return Results.File(path, "video/mp2t");
@@ -158,33 +180,11 @@ public static class StreamEndpoints
             : Results.NotFound();
     }
 
-    /// <summary>Sestaví statický VOD playlist z celkové délky – přehrávač zná celý čas a může seekovat.</summary>
-    private static string BuildVodPlaylist(double durationSeconds)
-    {
-        const double seg = TranscodeSession.SegmentSeconds;
-        var count = Math.Max(1, (int)Math.Ceiling(durationSeconds / seg));
+    private static MediaProbe ForSelectedAudio(MediaProbe probe, AudioTrackInfo? selected) =>
+        selected is null ? probe : probe with { AudioCodec = selected.Codec };
 
-        var targetDuration = (int)Math.Ceiling(seg) + 1;
-        var sb = new System.Text.StringBuilder();
-        sb.Append("#EXTM3U\n");
-        sb.Append("#EXT-X-VERSION:3\n");
-        sb.Append($"#EXT-X-TARGETDURATION:{targetDuration}\n");
-        sb.Append("#EXT-X-MEDIA-SEQUENCE:0\n");
-        sb.Append("#EXT-X-PLAYLIST-TYPE:VOD\n");
-        sb.Append("#EXT-X-INDEPENDENT-SEGMENTS\n");
-
-        for (var i = 0; i < count; i++)
-        {
-            var segDur = i < count - 1 ? seg : Math.Max(0.1, durationSeconds - (count - 1) * seg);
-            sb.Append("#EXTINF:")
-              .Append(segDur.ToString("F3", System.Globalization.CultureInfo.InvariantCulture))
-              .Append(",\n")
-              .Append($"seg{i:D5}.ts\n");
-        }
-
-        sb.Append("#EXT-X-ENDLIST\n");
-        return sb.ToString();
-    }
+    private static string SessionQuery(Guid? session) =>
+        session is { } token ? $"&session={token:D}" : "";
 
     private static async Task EnsureProbedAsync(
         LibraryDbContext db, FfprobeService ffprobe, MediaFile file, CancellationToken ct)

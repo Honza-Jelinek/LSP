@@ -57,10 +57,14 @@ public sealed class FfprobeService(FfmpegLocator locator, ILogger<FfprobeService
         psi.ArgumentList.Add("-show_streams");
         psi.ArgumentList.Add(filePath);
 
+        Process? proc = null;
         try
         {
-            using var proc = Process.Start(psi)!;
-            var json = await proc.StandardOutput.ReadToEndAsync(ct);
+            proc = Process.Start(psi) ?? throw new InvalidOperationException("ffprobe se nespustil");
+            var stdout = proc.StandardOutput.ReadToEndAsync(ct);
+            var stderr = proc.StandardError.ReadToEndAsync(ct);
+            var json = await stdout;
+            await stderr;
             await proc.WaitForExitAsync(ct);
 
             if (proc.ExitCode != 0 || string.IsNullOrWhiteSpace(json))
@@ -68,11 +72,24 @@ public sealed class FfprobeService(FfmpegLocator locator, ILogger<FfprobeService
 
             return ParseProbeJson(json);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            KillProcess(proc);
+            throw;
+        }
         catch (Exception ex)
         {
+            KillProcess(proc);
             log.LogWarning(ex, "ffprobe selhal pro {Path}", filePath);
             return null;
         }
+        finally { proc?.Dispose(); }
+    }
+
+    private static void KillProcess(Process? proc)
+    {
+        try { if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true); }
+        catch { /* process may have exited concurrently */ }
     }
 
     public static MediaProbe ParseProbeJson(string json)
