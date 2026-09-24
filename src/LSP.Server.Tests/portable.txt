@@ -1,0 +1,1 @@
+Test runs keep application logs and other incidental files in the build output, outside the user's installed library.

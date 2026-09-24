@@ -1,5 +1,5 @@
-using System.Text.Json;
 using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
 using LSP.Server.Data;
 using LSP.Server.External;
 using LSP.Server.Library.Parsing;
@@ -18,7 +18,7 @@ public sealed record EnrichmentProgress(double Phase, string PhaseName, int Proc
 
 /// <summary>
 /// Kaskáda s vahami a confidence:
-///   alias/folder → ParseCache → TMDB kandidáti + scoring → LLM → review queue
+///   titulový alias / IMDb → TMDB kandidáti + scoring → LLM → review queue
 /// Pro seriály: match show podle složky → season API pro epizody (1 call/sezóna místo N/search).
 /// </summary>
 public sealed class EnrichmentService(
@@ -61,7 +61,7 @@ public sealed class EnrichmentService(
 
         _forceRefresh = force;
 
-        // Načti aliasy do paměti (folder→TMDB, title→TMDB)
+        // Staré složkové aliasy nejsou dostatečně přesné pro automatické přiřazení.
         var aliases = await db.MatchAliases.ToListAsync(ct);
         var roots = await db.LibraryFolders.Select(f => f.Path).ToListAsync(ct);
 
@@ -85,7 +85,7 @@ public sealed class EnrichmentService(
             if (movie.TmdbId is not null) { skipped++; continue; }
 
             // Zkus alias
-            var alias = ResolveAlias(aliases, movie.Title, movie.MediaFile.Path, "movie", roots);
+            var alias = ResolveAlias(aliases, movie.Title, "movie");
             if (alias is not null)
             {
                 var detail = await tmdb.GetDetailsAsync(alias.Value.TmdbId, "movie", ct);
@@ -111,7 +111,7 @@ public sealed class EnrichmentService(
                 }
             }
 
-            var (cached, score, candidates) = await TryTmdbMovieThenTvScoredAsync(movie.Title, movie.Year, "movie", fetchPosters, ct);
+            var (cached, score, candidates) = await TryTmdbScoredAsync(movie.Title, movie.Year, "movie", fetchPosters, ct);
             if (cached is not null && score >= AutoApplyThreshold)
             {
                 ApplyToMovie(movie, cached);
@@ -124,23 +124,6 @@ public sealed class EnrichmentService(
                 if (hasLlm)
                     await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys,
                         movie, movie.Title, movie.Year, candidates, roots, ct);
-            }
-            else
-            {
-                // Low score: zkus TV fallback se scoringem
-                var (tvCached, tvScore, tvCandidates) = await TryTmdbMovieThenTvScoredAsync(movie.Title, null, "tv", fetchPosters, ct);
-                if (tvCached is not null && tvScore >= AutoApplyThreshold)
-                {
-                    ApplyToMovie(movie, tvCached);
-                    if (tvCached.PosterFile is not null) posters++;
-                    hits++;
-                }
-                else if (tvCached is not null && tvScore >= ReviewThreshold)
-                {
-                    if (hasLlm)
-                        await TryQueuePendingMovieChoiceAsync(chooseInputs, pendingMovies, movieChoiceKeys,
-                            movie, movie.Title, movie.Year, tvCandidates, roots, ct);
-                }
             }
         }
 
@@ -156,9 +139,8 @@ public sealed class EnrichmentService(
             if (force) ClearMetadata(show);
             if (show.TmdbId is not null) { skipped++; continue; }
 
-            // Zkus alias (přes cestu první epizody, aby fungovaly i folder aliasy)
-            var firstEpisodePath = show.Episodes.Count > 0 ? show.Episodes[0].MediaFile.Path : null;
-            var alias = ResolveAlias(aliases, show.Title, firstEpisodePath, "tv", roots);
+            // Zkus titulový alias správného typu.
+            var alias = ResolveAlias(aliases, show.Title, "tv");
             if (alias is not null)
             {
                 var detail = await tmdb.GetDetailsAsync(alias.Value.TmdbId, "tv", ct);
@@ -226,14 +208,14 @@ public sealed class EnrichmentService(
                     continue;
                 }
 
-                if (!input.Candidates.Any(c => c.TmdbId == chosenId && c.MediaType == input.ExpectedKind))
+                if (chosenId <= 0 || !input.Candidates.Any(c => c.TmdbId == chosenId && c.MediaType == input.ExpectedKind))
                 {
                     log.LogWarning("LLM zvolilo nenabídnuté ID {Id} nebo nesprávný typ pro '{Key}'", chosenId, input.ItemKey);
                     continue;
                 }
 
                 var detail = await tmdb.GetDetailsAsync(chosenId, input.ExpectedKind, ct);
-                if (detail is null || detail.TmdbId != chosenId || detail.MediaType != input.ExpectedKind)
+                if (!IsExpectedIdentity(detail, chosenId, input.ExpectedKind))
                 {
                     log.LogWarning("TMDB detail neodpovídá vybrané identitě {Type}:{Id} pro '{Key}'",
                         input.ExpectedKind, chosenId, input.ItemKey);
@@ -319,7 +301,7 @@ public sealed class EnrichmentService(
                         }
                         else
                         {
-                            var (cached, score, _) = await TryTmdbMovieThenTvScoredAsync(parsed.Title, parsed.Year, "movie", fetchPosters, ct);
+                            var (cached, score, _) = await TryTmdbScoredAsync(parsed.Title, parsed.Year, "movie", fetchPosters, ct);
                             if (cached is not null && score >= AutoApplyThreshold)
                             {
                                 ApplyToMovie(movie, cached);
@@ -414,8 +396,8 @@ public sealed class EnrichmentService(
         }
     }
 
-    private (int TmdbId, string MediaType)? ResolveAlias(
-        List<MatchAlias> aliases, string title, string? filePath, string expectedType, IReadOnlyCollection<string>? roots = null)
+    private static (int TmdbId, string MediaType)? ResolveAlias(
+        List<MatchAlias> aliases, string title, string expectedType)
     {
         // Legacy folder aliases store only a basename. Their scope is ambiguous (library root,
         // genre, or title folder), so they must never supply an automatic identity.
@@ -487,15 +469,6 @@ public sealed class EnrichmentService(
             title, mediaType, bestCandidate.Title, bestCandidate.TmdbId, bestScore);
 
         return (cached, bestScore, candidates);
-    }
-
-    /// <summary>Vyhledá pouze očekávaný typ; TV identita se nesmí aplikovat na Movie.</summary>
-    private async Task<(TmdbCache? best, double score, IReadOnlyList<TmdbSearchResult> candidates)> TryTmdbMovieThenTvScoredAsync(
-        string title, int? year, string mediaType, bool fetchPosters, CancellationToken ct)
-    {
-        return mediaType == "movie"
-            ? await TryTmdbScoredAsync(title, year, "movie", fetchPosters, ct)
-            : (null, 0.0, []);
     }
 
     /// <summary>Zkusí TMDB "tv" search pro víc titulových variant, vrátí nejlepší skóre; skončí dřív při jistém zásahu.</summary>
