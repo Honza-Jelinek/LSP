@@ -393,6 +393,9 @@ export function Player({ mediaFileId, title, fromStart, onClose, onPlayNext, onP
   // Klávesové zkratky (mezerník, šipky, F, Esc).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Sliders and menus already handle their own keys; volume arrows must not seek video.
+      if (e.defaultPrevented || (e.target instanceof Element &&
+          e.target.closest('input, textarea, select, [contenteditable="true"], [role="slider"], [role="menu"]'))) return
       switch (e.key) {
         case ' ': e.preventDefault(); togglePlay(); break
         case 'ArrowRight': seekBy(10); break
