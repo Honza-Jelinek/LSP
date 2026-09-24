@@ -59,6 +59,7 @@ public static class LspServiceCollectionExtensions
         services.AddScoped<FfprobeService>();
         services.AddScoped<SubtitleService>();
         services.AddSingleton<TranscodeSessionManager>();
+        services.AddSingleton<ProgressWriteCoordinator>();
 
         return services;
     }

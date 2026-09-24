@@ -7,7 +7,8 @@ using Microsoft.EntityFrameworkCore;
 
 namespace LSP.Server.Api;
 
-public sealed record SaveProgressRequest(int MediaFileId, double PositionSeconds, double? DurationSeconds);
+public sealed record SaveProgressRequest(int MediaFileId, double PositionSeconds, double? DurationSeconds,
+    Guid? SessionId = null, long? Sequence = null);
 public sealed record ProgressDto(double PositionSeconds, double? DurationSeconds, bool Finished);
 
 public sealed record ContinueItemDto(
@@ -36,65 +37,88 @@ public static class ProgressEndpoints
     }
 
     private static async Task<IResult> SaveProgress(
-        SaveProgressRequest req, LibraryDbContext db, CancellationToken ct)
+        SaveProgressRequest req, LibraryDbContext db, ProgressWriteCoordinator writers, CancellationToken ct)
     {
+        if (!double.IsFinite(req.PositionSeconds) || req.PositionSeconds < 0 ||
+            (req.DurationSeconds is { } duration && (!double.IsFinite(duration) || duration <= 0)) ||
+            (req.SessionId.HasValue != req.Sequence.HasValue) || req.SessionId == Guid.Empty || req.Sequence <= 0)
+            return Results.BadRequest("Neplatná pozice nebo identifikace přehrávání.");
+
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == req.MediaFileId, ct);
         if (file is null) return Results.NotFound();
 
-        var finished = req.DurationSeconds is > 0
-                       && req.PositionSeconds >= req.DurationSeconds * FinishedThreshold;
-
-        var progress = await db.PlaybackProgress.FirstOrDefaultAsync(p => p.Path == file.Path, ct);
-        if (progress is null)
+        return await writers.WithLockAsync<IResult>(file.Path, async state =>
         {
-            progress = new PlaybackProgress { Path = file.Path };
-            db.PlaybackProgress.Add(progress);
-        }
+            if (!state.CanWrite(req.SessionId, req.Sequence))
+                return Results.Conflict("Pozice pochází ze staršího přehrávání nebo požadavku.");
+            var progress = await db.PlaybackProgress.FirstOrDefaultAsync(p => p.Path == file.Path, ct);
+            if (progress is null)
+            {
+                progress = new PlaybackProgress { Path = file.Path };
+                db.PlaybackProgress.Add(progress);
+            }
 
-        progress.PositionSeconds = req.PositionSeconds;
-        progress.DurationSeconds = req.DurationSeconds;
-        progress.Finished = finished;
-        progress.UpdatedAt = DateTime.UtcNow;
+            progress.PositionSeconds = req.PositionSeconds;
+            progress.DurationSeconds = req.DurationSeconds;
+            progress.Finished = req.DurationSeconds is > 0 && req.PositionSeconds >= req.DurationSeconds * FinishedThreshold;
+            progress.UpdatedAt = DateTime.UtcNow;
 
-        await db.SaveChangesAsync(ct);
-        // Segmenty se NEMAŽOU na finished (uživatel může ještě koukat na konec / titulky) —
-        // purge až při přepnutí na jinou epizodu (DELETE /api/stream/{id}/segments).
-        return Results.NoContent();
+            await db.SaveChangesAsync(ct);
+            state.Commit(req.Sequence);
+            return Results.NoContent();
+        }, ct);
     }
 
-    private static async Task<IResult> GetProgress(int mediaFileId, LibraryDbContext db, CancellationToken ct)
+    private static async Task<IResult> GetProgress(int mediaFileId, Guid? session, LibraryDbContext db,
+        ProgressWriteCoordinator writers, CancellationToken ct)
     {
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == mediaFileId, ct);
         if (file is null) return Results.NotFound();
 
-        var progress = await db.PlaybackProgress.FirstOrDefaultAsync(p => p.Path == file.Path, ct);
-        if (progress is null) return Results.NoContent();
-
-        return Results.Ok(new ProgressDto(progress.PositionSeconds, progress.DurationSeconds, progress.Finished));
+        return await writers.WithLockAsync<IResult>(file.Path, async state =>
+        {
+            var progress = await db.PlaybackProgress.FirstOrDefaultAsync(p => p.Path == file.Path, ct);
+            ct.ThrowIfCancellationRequested();
+            if (session is { } id && !state.Begin(id))
+                return Results.Conflict("Toto přehrávání už bylo nahrazeno novějším.");
+            return progress is null ? Results.NoContent()
+                : Results.Ok(new ProgressDto(progress.PositionSeconds, progress.DurationSeconds, progress.Finished));
+        }, ct);
     }
 
     /// <summary>Smaže progress jednoho souboru → zmizí z „Pokračovat v přehrávání".</summary>
     private static async Task<IResult> DeleteProgress(
-        int mediaFileId, LibraryDbContext db, TranscodeSessionManager sessions, CancellationToken ct)
+        int mediaFileId, LibraryDbContext db, TranscodeSessionManager sessions, ProgressWriteCoordinator writers, CancellationToken ct)
     {
         var file = await db.MediaFiles.FirstOrDefaultAsync(f => f.Id == mediaFileId, ct);
         if (file is null) return Results.NotFound();
 
-        await db.PlaybackProgress.Where(p => p.Path == file.Path).ExecuteDeleteAsync(ct);
+        await writers.WithLockAsync(file.Path, async state =>
+        {
+            await db.PlaybackProgress.Where(p => p.Path == file.Path).ExecuteDeleteAsync(ct);
+            state.Revoke();
+            return true;
+        }, ct);
         sessions.PurgeSegments(mediaFileId);
         return Results.NoContent();
     }
 
     /// <summary>Smaže progress všech epizod seriálu → celý seriál zmizí z „Pokračovat v přehrávání".</summary>
     private static async Task<IResult> DeleteShowProgress(
-        int showId, LibraryDbContext db, TranscodeSessionManager sessions, CancellationToken ct)
+        int showId, LibraryDbContext db, TranscodeSessionManager sessions, ProgressWriteCoordinator writers, CancellationToken ct)
     {
         var files = await db.Episodes.Where(e => e.ShowId == showId)
             .Select(e => new { e.MediaFileId, e.MediaFile.Path }).ToListAsync(ct);
-        var paths = files.Select(f => f.Path).ToList();
-        await db.PlaybackProgress.Where(p => paths.Contains(p.Path)).ExecuteDeleteAsync(ct);
         foreach (var f in files)
+        {
+            await writers.WithLockAsync(f.Path, async state =>
+            {
+                await db.PlaybackProgress.Where(p => p.Path == f.Path).ExecuteDeleteAsync(ct);
+                state.Revoke();
+                return true;
+            }, ct);
             sessions.PurgeSegments(f.MediaFileId);
+        }
         return Results.NoContent();
     }
 
@@ -103,7 +127,7 @@ public static class ProgressEndpoints
 
     /// <summary>
     /// „Pokračovat v přehrávání" – Netflix model. Filmy: nedokoukané. Seriály: JEDEN záznam na seriál –
-    /// rozkoukaná epizoda, jinak DALŠÍ epizoda po nejvyšší dokoukané (počítá se dynamicky z progressu).
+    /// poslední smysluplně sledovaná epizoda, nebo další díl po jejím dokončení.
     /// </summary>
     private static async Task<IResult> GetContinueWatching(LibraryDbContext db, CancellationToken ct) =>
         Results.Ok(await BuildContinueItemsAsync(db, ct));
@@ -144,26 +168,23 @@ public static class ProgressEndpoints
         // Seriály – jeden záznam na seriál.
         foreach (var show in records.Where(r => r.ShowId is not null).GroupBy(r => r.ShowId!.Value))
         {
-            // 1) Rozkoukaná epizoda (nejdál v pořadí) → resume.
-            var active = show
-                .Where(e => !e.Finished && e.PositionSeconds > StartedThreshold)
-                .OrderByDescending(e => e.Season).ThenByDescending(e => e.Number)
+            // Čas aktivity rozlišuje postup vpřed od úmyslného opětovného sledování.
+            var latest = show
+                .Where(e => e.Finished || e.PositionSeconds > StartedThreshold)
+                .OrderByDescending(e => e.UpdatedAt)
+                .ThenByDescending(e => e.Season).ThenByDescending(e => e.Number)
                 .FirstOrDefault();
-            if (active is not null)
+            if (latest is null) continue;
+            if (!latest.Finished)
             {
-                items.Add((active.UpdatedAt, new ContinueItemDto(
-                    active.Id, "episode", active.ShowId, active.ShowTitle!, $"S{active.Season:D2}E{active.Number:D2}",
-                    ShowPosterUrl(active.ShowId, active.ShowTmdbId, active.ShowHasPoster),
-                    active.PositionSeconds, active.DurationSeconds, Percent(active.PositionSeconds, active.DurationSeconds))));
+                items.Add((latest.UpdatedAt, new ContinueItemDto(
+                    latest.Id, "episode", latest.ShowId, latest.ShowTitle!, $"S{latest.Season:D2}E{latest.Number:D2}",
+                    ShowPosterUrl(latest.ShowId, latest.ShowTmdbId, latest.ShowHasPoster),
+                    latest.PositionSeconds, latest.DurationSeconds, Percent(latest.PositionSeconds, latest.DurationSeconds))));
                 continue;
             }
 
-            // 2) Jinak: další epizoda po nejvyšší dokoukané.
-            var lastFinished = show
-                .Where(e => e.Finished)
-                .OrderByDescending(e => e.Season).ThenByDescending(e => e.Number)
-                .FirstOrDefault();
-            if (lastFinished is null) continue; // seriál reálně nezačal
+            var lastFinished = latest;
 
             var next = await db.Episodes
                 .Where(e => e.ShowId == show.Key
