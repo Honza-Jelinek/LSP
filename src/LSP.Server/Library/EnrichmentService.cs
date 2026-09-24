@@ -261,8 +261,7 @@ public sealed class EnrichmentService(
 
             if (missingMovies.Count > 0 || missingShows.Count > 0)
             {
-                llmFallbacks = missingMovies.Count + missingShows.Count;
-                log.LogInformation("Fáze 3 (LLM fallback): {Count} položek", llmFallbacks);
+                llmFallbacks = missingMovies.Count;
                 var llmProcessed = 0;
 
                 if (missingMovies.Count > 0)
@@ -319,6 +318,12 @@ public sealed class EnrichmentService(
                     }
                 }
 
+                // Film překlasifikovaný na epizodu mohl mezitím rozpoznat některý původně
+                // chybějící seriál. Jeho dřívější snapshot už nesmí přepsat přijatou shodu.
+                missingShows = missingShows.Where(s => !s.IsManual && s.TmdbId is null).ToList();
+                llmFallbacks += missingShows.Count;
+                log.LogInformation("Fáze 3 (LLM fallback): {Count} položek", llmFallbacks);
+
                 // Seriály (obvykle jeden na složku, ale pro konzistenci stejný pattern)
                 if (missingShows.Count > 0)
                 {
@@ -333,8 +338,9 @@ public sealed class EnrichmentService(
                         if (parsed is null || string.IsNullOrWhiteSpace(parsed.Title)) continue;
 
                         var show = missingShows[i];
+                        if (show.IsManual || show.TmdbId is not null) continue;
                         var (cached, score, _) = await TryTmdbScoredAsync(parsed.Title, null, "tv", fetchPosters, ct);
-                        if (cached is not null && score >= AutoApplyThreshold)
+                        if (!show.IsManual && show.TmdbId is null && cached is not null && score >= AutoApplyThreshold)
                         {
                             ApplyToShow(show, cached);
                             if (cached.PosterFile is not null) posters++;
