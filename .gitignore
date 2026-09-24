@@ -28,6 +28,8 @@ tools/ffmpeg/*
 
 # Installer
 artifacts/
-installer/
+installer/*
+!installer/build-installer.ps1
+!installer/LSP.iss
 
 graphify-out/
