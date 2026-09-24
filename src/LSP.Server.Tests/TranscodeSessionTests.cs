@@ -71,7 +71,11 @@ public sealed class TranscodeSessionTests
             Assert.Contains("#EXTINF:1.000000", playlist);
             session.PauseEncoding(true);
             Assert.Empty(Directory.EnumerateFiles(session.WorkingDirectory));
-            var file = await session.GetSegmentAsync(1);
+            var held = session.GetSegmentAsync(1);
+            await Task.Delay(50);
+            Assert.False(held.IsCompleted);
+            session.PauseEncoding(false);
+            var file = await held;
             Assert.NotNull(file);
             Assert.True(new FileInfo(file).Length > 0);
             Assert.Single(Directory.EnumerateFiles(session.WorkingDirectory, "seg*.ts"));
@@ -167,6 +171,24 @@ public sealed class TranscodeSessionTests
             Assert.NotNull(file);
             Assert.True(new FileInfo(file).Length > 0);
             Assert.Single(Directory.EnumerateFiles(session.WorkingDirectory, "seg*.ts"));
+        }
+        finally { TryDelete(dir); }
+    }
+
+    [Fact]
+    public async Task Dispose_releases_segment_request_waiting_for_resume()
+    {
+        var dir = NewDir();
+        try
+        {
+            var session = new TranscodeSession(7, "unused.mkv",
+                new PlaybackPlan(PlaybackMode.Hls, false, false), 4,
+                Path.Combine(dir, "segments"), "unused-ffmpeg", "libopenh264", NullLogger.Instance);
+            session.PauseEncoding(true);
+            var held = session.GetSegmentAsync(0);
+            Assert.False(held.IsCompleted);
+            session.Dispose();
+            Assert.Null(await held);
         }
         finally { TryDelete(dir); }
     }
